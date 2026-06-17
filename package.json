@@ -1,0 +1,147 @@
+{
+  "name": "claude-session-monitor",
+  "displayName": "Claude Session Monitor",
+  "description": "Tüm Claude Code oturumlarını canlı izle: hangisi çalışıyor, hangisi seni bekliyor, hangisi limite takıldı.",
+  "version": "0.1.1",
+  "publisher": "softween",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/softween/claude-session-monitor.git"
+  },
+  "engines": {
+    "vscode": "^1.84.0"
+  },
+  "categories": [
+    "Other"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./dist/extension.js",
+  "contributes": {
+    "viewsContainers": {
+      "activitybar": [
+        {
+          "id": "claudeSessionMonitor",
+          "title": "Claude Oturumları",
+          "icon": "media/icon.svg"
+        }
+      ]
+    },
+    "views": {
+      "claudeSessionMonitor": [
+        {
+          "id": "claudeSessionMonitor.view",
+          "name": "Oturumlar"
+        }
+      ]
+    },
+    "commands": [
+      {
+        "command": "claudeSessionMonitor.refresh",
+        "title": "Claude Oturumları: Yenile",
+        "icon": "$(refresh)"
+      },
+      {
+        "command": "claudeSessionMonitor.focus",
+        "title": "Claude Oturumları: Panele Git"
+      },
+      {
+        "command": "claudeSessionMonitor.openTranscript",
+        "title": "Claude Oturumları: Transcript'i Aç"
+      },
+      {
+        "command": "claudeSessionMonitor.toggleWorkspaceOnly",
+        "title": "Claude Oturumları: Sadece Bu Workspace",
+        "icon": "$(filter)"
+      },
+      {
+        "command": "claudeSessionMonitor.clearEnded",
+        "title": "Claude Oturumları: Kapananları Temizle",
+        "icon": "$(clear-all)"
+      }
+    ],
+    "menus": {
+      "view/title": [
+        {
+          "command": "claudeSessionMonitor.toggleWorkspaceOnly",
+          "when": "view == claudeSessionMonitor.view",
+          "group": "navigation@1"
+        },
+        {
+          "command": "claudeSessionMonitor.refresh",
+          "when": "view == claudeSessionMonitor.view",
+          "group": "navigation@2"
+        },
+        {
+          "command": "claudeSessionMonitor.clearEnded",
+          "when": "view == claudeSessionMonitor.view",
+          "group": "overflow"
+        }
+      ],
+      "view/item/context": [
+        {
+          "command": "claudeSessionMonitor.openTranscript",
+          "when": "view == claudeSessionMonitor.view && viewItem == session",
+          "group": "inline"
+        }
+      ]
+    },
+    "configuration": {
+      "title": "Claude Session Monitor",
+      "properties": {
+        "claudeSessionMonitor.notifyOnWaiting": {
+          "type": "boolean",
+          "default": true,
+          "description": "Bir oturum izin/girdi beklemeye geçtiğinde bildirim göster."
+        },
+        "claudeSessionMonitor.notifyOnLimited": {
+          "type": "boolean",
+          "default": true,
+          "description": "Bir oturum oturum/rate limitine takıldığında bildirim göster."
+        },
+        "claudeSessionMonitor.notifyOnDone": {
+          "type": "boolean",
+          "default": false,
+          "description": "Bir oturum turn'ü bitirdiğinde (senin sıran) bildirim göster."
+        },
+        "claudeSessionMonitor.pollIntervalMs": {
+          "type": "number",
+          "default": 1500,
+          "minimum": 500,
+          "description": "Durum yenileme aralığı (ms)."
+        },
+        "claudeSessionMonitor.recentScanMaxAgeHours": {
+          "type": "number",
+          "default": 6,
+          "description": "Son N saatte aktif olan oturumları listede göster."
+        },
+        "claudeSessionMonitor.hideEndedAfterMinutes": {
+          "type": "number",
+          "default": 30,
+          "description": "Kapanan oturumları bu süreden sonra gizle (dakika)."
+        },
+        "claudeSessionMonitor.workspaceOnly": {
+          "type": "boolean",
+          "default": false,
+          "description": "Sadece bu VS Code workspace'ine ait oturumları göster."
+        }
+      }
+    }
+  },
+  "scripts": {
+    "build": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --minify",
+    "watch": "esbuild src/extension.ts --bundle --outfile=dist/extension.js --external:vscode --format=cjs --platform=node --sourcemap --watch",
+    "verify": "esbuild src/verify.ts --bundle --platform=node --format=cjs --outfile=dist/verify.cjs && node dist/verify.cjs",
+    "vscode:prepublish": "npm run build",
+    "package": "vsce package --allow-missing-repository --no-dependencies"
+  },
+  "devDependencies": {
+    "@types/node": "^20.11.0",
+    "@types/vscode": "^1.84.0",
+    "@vscode/vsce": "^3.2.0",
+    "esbuild": "^0.24.0",
+    "typescript": "^5.4.0"
+  }
+}
