@@ -322,7 +322,7 @@ function resolve(
   const lastActivity = Math.max(hookTs, convTs, tx?.activityTs ?? 0, mtimeS);
 
   const title =
-    tx?.title || hook?.prompt || tx?.lastPrompt || `oturum ${sessionId.slice(0, 8)}`;
+    tx?.title || hook?.prompt || tx?.lastPrompt || `session ${sessionId.slice(0, 8)}`;
   const cwd = hook?.cwd || tx?.cwd;
   const cwdLabel = cwd ? path.basename(cwd) : undefined;
   const transcriptPath = hook?.transcript_path || opts.txPath;
@@ -336,7 +336,7 @@ function resolve(
   const applyWorking = () => {
     bucket = "working";
     stale = now - lastActivity > STALE_SECONDS;
-    sub = stale ? "çalışıyor (yanıt yok?)" : "çalışıyor";
+    sub = stale ? "working (stalled?)" : "working";
   };
 
   // 1) "limited" wins only when the api-error is at least as new as the newest
@@ -344,10 +344,10 @@ function resolve(
   if (tx?.limit && (tx.limit.kind === "session" || tx.limit.kind === "rate") && convTs >= hookTs) {
     bucket = "limited";
     if (tx.limit.kind === "session") {
-      sub = "oturum limiti";
+      sub = "session limit";
       resetText = tx.limit.resetText;
     } else {
-      sub = "rate limit";
+      sub = "rate limited";
     }
   }
 
@@ -359,15 +359,15 @@ function resolve(
         break;
       case "waiting":
         bucket = "attention";
-        sub = "seni bekliyor";
+        sub = "waiting for you";
         break;
       case "idle":
         bucket = "attention";
-        sub = "turn bitti";
+        sub = "your turn";
         break;
       case "ended":
         bucket = "ended";
-        sub = "kapandı";
+        sub = "ended";
         break;
       default:
         break;
@@ -385,16 +385,16 @@ function resolve(
         break;
       case "end_turn":
         bucket = "attention";
-        sub = "turn bitti";
+        sub = "your turn";
         break;
       case "api_error":
         bucket = "attention";
-        sub = "API hatası";
+        sub = "API error";
         break;
       default:
         if (hook?.state === "ended") {
           bucket = "ended";
-          sub = "kapandı";
+          sub = "ended";
         }
         break;
     }
@@ -409,13 +409,13 @@ function resolve(
 
   const tipLines = [
     title,
-    `durum: ${sub}`,
+    `status: ${sub}`,
     cwd ? `cwd: ${cwd}` : "",
-    entrypoint ? `kaynak: ${entrypoint}` : "",
-    hook?.permission_mode ? `mod: ${hook.permission_mode}` : "",
-    hook?.message ? `bildirim: ${hook.message}` : "",
+    entrypoint ? `source: ${entrypoint}` : "",
+    hook?.permission_mode ? `mode: ${hook.permission_mode}` : "",
+    hook?.message ? `notification: ${hook.message}` : "",
     resetText ? `limit reset: ${formatReset(resetText, now)}` : "",
-    lastActivity ? `son aktivite: ${ageStr} önce` : "",
+    lastActivity ? `last activity: ${ageStr} ago` : "",
     `id: ${sessionId}`,
   ].filter(Boolean);
 
@@ -441,10 +441,10 @@ function resolve(
 
 export function humanizeAge(seconds: number): string {
   if (!Number.isFinite(seconds) || seconds < 0) return "";
-  if (seconds < 60) return `${Math.floor(seconds)}sn`;
-  if (seconds < 3600) return `${Math.floor(seconds / 60)}dk`;
-  if (seconds < 86400) return `${Math.floor(seconds / 3600)}sa`;
-  return `${Math.floor(seconds / 86400)}g`;
+  if (seconds < 60) return `${Math.floor(seconds)}s`;
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h`;
+  return `${Math.floor(seconds / 86400)}d`;
 }
 
 /** Parse a limit reset clock like "1:50pm" / "1:50am" / "13:50" to epoch sec. */
@@ -469,8 +469,8 @@ export function formatReset(resetText: string, nowSec: number): string {
   const t = parseResetToEpoch(resetText, nowSec);
   if (!t) return resetText;
   const remain = t - nowSec;
-  if (remain <= 0) return `${resetText} (şimdi)`;
-  return `${resetText} (${humanizeAge(remain)} kaldı)`;
+  if (remain <= 0) return `${resetText} (now)`;
+  return `${resetText} (${humanizeAge(remain)} left)`;
 }
 
 // ---------------------------------------------------------------------------
@@ -685,4 +685,67 @@ export function cleanupEndedMonitorFiles(now: number, staleMs = 12 * 3600 * 1000
     }
   }
   return removed;
+}
+
+// ---------------------------------------------------------------------------
+// Rate-limit budget (written by statusline.sh from Claude Code's rate_limits)
+// ---------------------------------------------------------------------------
+
+export const LIMITS_FILE = path.join(MONITOR_DIR, "limits.json");
+export const LIMITS_HISTORY = path.join(MONITOR_DIR, "limits-history.jsonl");
+
+/** Raw shape written by statusline.sh. Utilization may be 0-1 or 0-100. */
+export interface RawLimits {
+  fh?: number | null;
+  fh_reset?: number | string | null;
+  sd?: number | null;
+  sd_reset?: number | string | null;
+  sds?: number | null;
+  sds_reset?: number | string | null;
+  model?: string;
+  ts?: number;
+}
+
+export function readLimits(): RawLimits | undefined {
+  try {
+    return JSON.parse(fs.readFileSync(LIMITS_FILE, "utf8")) as RawLimits;
+  } catch {
+    return undefined;
+  }
+}
+
+export function readLimitsHistory(maxPoints = 240): RawLimits[] {
+  let text = "";
+  let partialFirst = false;
+  try {
+    const r = readTail(LIMITS_HISTORY, 256 * 1024);
+    text = r.text;
+    partialFirst = r.partialFirst;
+  } catch {
+    return [];
+  }
+  const lines = text.split("\n");
+  if (partialFirst && lines.length) lines.shift();
+  const out: RawLimits[] = [];
+  for (const ln of lines) {
+    const s = ln.trim();
+    if (!s) continue;
+    try {
+      out.push(JSON.parse(s) as RawLimits);
+    } catch {
+      // ignore
+    }
+  }
+  return out.slice(-maxPoints);
+}
+
+export function pruneLimitsHistory(maxLines = 3000): void {
+  try {
+    const lines = fs.readFileSync(LIMITS_HISTORY, "utf8").split("\n").filter((l) => l.trim());
+    if (lines.length > maxLines) {
+      fs.writeFileSync(LIMITS_HISTORY, lines.slice(-maxLines).join("\n") + "\n");
+    }
+  } catch {
+    // ignore
+  }
 }

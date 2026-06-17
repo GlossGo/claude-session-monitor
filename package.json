@@ -1,8 +1,8 @@
 {
   "name": "claude-session-monitor",
   "displayName": "Claude Session Monitor",
-  "description": "Tüm Claude Code oturumlarını canlı izle: hangisi çalışıyor, hangisi seni bekliyor, hangisi limite takıldı.",
-  "version": "0.2.0",
+  "description": "Live monitor for all your Claude Code sessions: which is working, which is waiting for you, which hit a limit, plus per-session CPU/RAM and 5h/7d usage limits.",
+  "version": "0.3.0",
   "publisher": "softween",
   "license": "MIT",
   "repository": {
@@ -24,7 +24,7 @@
       "activitybar": [
         {
           "id": "claudeSessionMonitor",
-          "title": "Claude Oturumları",
+          "title": "Claude Sessions",
           "icon": "media/icon.svg"
         }
       ]
@@ -33,37 +33,42 @@
       "claudeSessionMonitor": [
         {
           "id": "claudeSessionMonitor.view",
-          "name": "Oturumlar"
+          "name": "Sessions"
+        },
+        {
+          "id": "claudeSessionMonitor.limits",
+          "name": "Usage limits",
+          "type": "webview"
         }
       ]
     },
     "commands": [
       {
         "command": "claudeSessionMonitor.refresh",
-        "title": "Claude Oturumları: Yenile",
+        "title": "Claude Sessions: Refresh",
         "icon": "$(refresh)"
       },
       {
         "command": "claudeSessionMonitor.focus",
-        "title": "Claude Oturumları: Panele Git"
+        "title": "Claude Sessions: Open Panel"
       },
       {
         "command": "claudeSessionMonitor.openTranscript",
-        "title": "Claude Oturumları: Transcript'i Aç"
+        "title": "Claude Sessions: Open Transcript"
       },
       {
         "command": "claudeSessionMonitor.toggleWorkspaceOnly",
-        "title": "Claude Oturumları: Sadece Bu Workspace",
+        "title": "Claude Sessions: This Workspace Only",
         "icon": "$(filter)"
       },
       {
         "command": "claudeSessionMonitor.toggleNeedsYouOnly",
-        "title": "Claude Oturumları: Sadece Seni Bekleyenler",
+        "title": "Claude Sessions: Needs-You Only",
         "icon": "$(bell)"
       },
       {
         "command": "claudeSessionMonitor.clearEnded",
-        "title": "Claude Oturumları: Kapananları Temizle",
+        "title": "Claude Sessions: Clear Ended",
         "icon": "$(clear-all)"
       }
     ],
@@ -104,58 +109,58 @@
         "claudeSessionMonitor.notifyOnWaiting": {
           "type": "boolean",
           "default": true,
-          "description": "Bir oturum izin/girdi beklemeye geçtiğinde bildirim göster."
+          "description": "Notify when a session starts waiting for permission/input."
         },
         "claudeSessionMonitor.notifyOnLimited": {
           "type": "boolean",
           "default": true,
-          "description": "Bir oturum oturum/rate limitine takıldığında bildirim göster."
+          "description": "Notify when a session hits a session/rate limit."
         },
         "claudeSessionMonitor.notifyOnDone": {
           "type": "boolean",
           "default": false,
-          "description": "Bir oturum turn'ü bitirdiğinde (senin sıran) bildirim göster."
+          "description": "Notify when a session finishes its turn (your turn)."
         },
         "claudeSessionMonitor.pollIntervalMs": {
           "type": "number",
           "default": 1500,
           "minimum": 500,
-          "description": "Durum yenileme aralığı (ms)."
+          "description": "Status refresh interval (ms)."
         },
         "claudeSessionMonitor.recentScanMaxAgeHours": {
           "type": "number",
           "default": 6,
-          "description": "Son N saatte aktif olan oturumları listede göster."
+          "description": "Show sessions that were active within the last N hours."
         },
         "claudeSessionMonitor.hideEndedAfterMinutes": {
           "type": "number",
           "default": 30,
-          "description": "Kapanan oturumları bu süreden sonra gizle (dakika)."
+          "description": "Hide ended sessions after this many minutes."
         },
         "claudeSessionMonitor.workspaceOnly": {
           "type": "boolean",
           "default": false,
-          "description": "Sadece bu VS Code workspace'ine ait oturumları göster."
+          "description": "Only show sessions belonging to this VS Code workspace."
         },
         "claudeSessionMonitor.nativeNotifications": {
           "type": "boolean",
           "default": true,
-          "description": "Limit/bekleme geçişlerinde native macOS bildirimi göster (VS Code odakta değilken bile)."
+          "description": "Show a native macOS notification on limit/waiting transitions (even when VS Code is not focused)."
         },
         "claudeSessionMonitor.stuckAlertMinutes": {
           "type": "number",
           "default": 5,
-          "description": "Çalışan bir oturum bu kadar dakika sessiz kalırsa 'takılmış olabilir' uyarısı (0 = kapalı)."
+          "description": "Alert when a working session stays silent this many minutes (0 = off)."
         },
         "claudeSessionMonitor.resourceSampleMs": {
           "type": "number",
           "default": 3000,
-          "description": "CPU/RAM örnekleme aralığı (ms)."
+          "description": "CPU/RAM sampling interval (ms)."
         },
         "claudeSessionMonitor.cpuHogThreshold": {
           "type": "number",
           "default": 60,
-          "description": "Bu CPU%'nin üstündeki oturumlar ateş ikonuyla işaretlenir."
+          "description": "Sessions above this CPU% are flagged with a flame icon."
         }
       }
     }

@@ -1,89 +1,112 @@
 # Claude Session Monitor
 
-Tüm açık Claude Code oturumlarını (VS Code sekmelerini) tek panelde **canlı** izle:
-hangisi çalışıyor, hangisi senden cevap bekliyor, hangisi oturum/rate limitine takıldı.
+Live monitor for all your open Claude Code sessions (VS Code tabs) in one panel:
+which is **working**, which is **waiting for you**, which **finished its turn**, and
+which **hit a session/rate limit**, plus **per-session CPU/RAM** and the account
+**5-hour / 7-day usage limits** charted at the bottom.
 
-10-15 sekmeyle çalışırken hangisinin ne durumda olduğunu tek bakışta görmek için.
+Built for working with 10-15 Claude tabs at once and seeing each one's state at a glance.
 
-## Ne gösterir
+## What it shows
 
-Activity Bar'da "Claude Oturumları" paneli, durumlara göre gruplu:
+Activity Bar container "Claude Sessions" with two views.
 
-| Grup | Anlamı |
-|------|--------|
-| 🔴 **Limit** | Oturum limiti (reset saatiyle) veya rate limit'e takıldı |
-| 🟡 **Seni bekliyor** | İzin/girdi bekliyor (Notification) — senin müdahaleni istiyor |
-| 🔵 **Turn bitti** | Cevabı bitirdi, senin sıran |
-| 🟢 **Çalışıyor** | Aktif işliyor (90sn aktivite yoksa "yanıt yok?" uyarısı) |
-| ⚪ **Kapandı** | Oturum sonlandı |
+### Sessions tree (grouped by live state)
 
-Ayrıca:
-- **Status bar** özeti: `$(pulse) 🟢n 🟡n 🔵n 🔴n` — limit varken kırmızı, bekleyen varken sarı arka plan.
-- **Toast bildirim**: bir oturum "seni bekliyor" ya da "limit" durumuna geçince (açılışta sessiz).
+| Group | Meaning |
+|-------|---------|
+| 🔴 **Limited** | Hit a session limit (with reset countdown) or got rate limited |
+| 🟡 **Waiting for you** | Needs permission/input (Notification) |
+| 🔵 **Your turn** | Finished its turn, your move |
+| 🟢 **Working** | Actively running (after 2 min silent it shows "working (stalled?)") |
+| ⚪ **Ended** | Session closed |
 
-## Durum nasıl tespit edilir
+Each row also shows that session's **CPU% + RAM** (e.g. `CPU 14% · 261MB`), a 🔥 on
+CPU hogs, and a live reset countdown for limited sessions. The panel header shows the
+total Claude load; the Activity Bar icon carries a badge with the count of sessions
+that need you.
 
-İki kaynak birleştirilir, `vscode` API'sine bağımlı olmayan saf bir veri katmanında (`src/core.ts`):
+Extras: in-VS-Code toasts + native macOS notifications on urgent transitions, a
+stuck-session alert, a "needs-you only" filter (bell button), and click a row to
+best-effort **jump to that session's tab** (falls back to opening the transcript).
 
-1. **Hook durum dosyaları** — `~/.claude/session-monitor/<id>.json`. `hook.py` (Claude Code
-   hook'u) SessionStart / UserPromptSubmit / Stop / Notification / SessionEnd olaylarında
-   yazar. "Seni bekliyor" sinyali yalnızca buradan gelir (transcript'te persist edilmez).
-2. **Transcript tail** — `~/.claude/projects/.../<id>.jsonl` son ~512KB'ı. Buradan:
-   - **Başlık** (`ai-title`, fallback `last-prompt`),
-   - en yeni **conversational** satır (working/turn-bitti),
-   - **limit** tespiti (`isApiErrorMessage` + 429: "hit your session limit" vs
-     "temporarily limiting / Rate limited"),
-   - **entrypoint** (sadece `claude-vscode`/`cli` gösterilir; `sdk-cli`/`sdk-py` olan
-     claude-mem observer + subagent oturumları elenir).
+### Usage limits (webview)
 
-Hook olayı ile transcript'in en yeni timestamp'i karşılaştırılır; hangisi yeniyse o kazanır.
-Limit, en yeni conversational olay api-error ise öne çıkar.
+Gauges for the **5-hour** and **7-day** account limits (and 7-day Sonnet if present)
+with percent used, color (green/yellow/red), a "resets in Xh Ym" countdown, and a
+usage sparkline over time.
 
-## Kurulum
+## How it works
 
-Hook katmanı (bir kez, `~/.claude/settings.json`'a additive olarak):
+A pure, `vscode`-free data layer (`src/core.ts`) merges three sources per session:
+
+1. **Hook status files** `~/.claude/session-monitor/<id>.json` written by `hook.py`
+   on SessionStart / UserPromptSubmit / Stop / Notification / SessionEnd. This is the
+   only source of "waiting for you" (permission prompts are not in the transcript) and
+   of the session's worker **PID** (captured by walking the process tree).
+2. **Transcript tail** `~/.claude/projects/.../<id>.jsonl` for the title (`ai-title`),
+   newest conversational state, and limit detection (`isApiErrorMessage` + 429).
+   Only `entrypoint == claude-vscode | cli` sessions are shown (SDK observers/subagents
+   filtered out).
+3. **Usage limits** `~/.claude/session-monitor/limits.json` + `limits-history.jsonl`
+   written by `statusline.sh` from Claude Code's `rate_limits` stdin (5h/7d utilization
+   + reset timestamps).
+
+The extension samples each session PID's CPU/RAM with `ps` (every ~3s).
+
+## Install
+
+Hook + status line (once, additive to `~/.claude/settings.json`):
 
 ```jsonc
 "hooks": {
-  "SessionStart":     [{ "matcher": "startup|resume|clear|compact",
-                         "hooks": [{ "type": "command", "command": "python3 ~/.claude/session-monitor/hook.py SessionStart" }] }],
-  "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "python3 ~/.claude/session-monitor/hook.py UserPromptSubmit" }] }],
-  "Stop":             [{ "hooks": [{ "type": "command", "command": "python3 ~/.claude/session-monitor/hook.py Stop" }] }],
-  "Notification":     [{ "hooks": [{ "type": "command", "command": "python3 ~/.claude/session-monitor/hook.py Notification" }] }],
-  "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "python3 ~/.claude/session-monitor/hook.py SessionEnd" }] }]
-}
+  "SessionStart":     [{ "matcher": "startup|resume|clear|compact", "hooks": [{ "type": "command", "command": "/opt/homebrew/bin/python3 ~/.claude/session-monitor/hook.py SessionStart" }] }],
+  "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "/opt/homebrew/bin/python3 ~/.claude/session-monitor/hook.py UserPromptSubmit" }] }],
+  "Stop":             [{ "hooks": [{ "type": "command", "command": "/opt/homebrew/bin/python3 ~/.claude/session-monitor/hook.py Stop" }] }],
+  "Notification":     [{ "hooks": [{ "type": "command", "command": "/opt/homebrew/bin/python3 ~/.claude/session-monitor/hook.py Notification" }] }],
+  "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "/opt/homebrew/bin/python3 ~/.claude/session-monitor/hook.py SessionEnd" }] }]
+},
+"statusLine": { "type": "command", "command": "bash ~/.claude/session-monitor/statusline.sh", "padding": 0 }
 ```
 
-Eklenti:
+> The status line is required to read the 5h/7d limit budget; it also prints a compact
+> `Claude  5h NN%  ·  7d NN%` line in each Claude session. Both the hooks and the status
+> line are picked up after a window reload.
+
+Extension:
 
 ```bash
 npm install
 npm run build
-npm run package        # -> claude-session-monitor-0.1.0.vsix
-code --install-extension claude-session-monitor-0.1.0.vsix
+npm run package        # -> claude-session-monitor-0.3.0.vsix
+code --install-extension claude-session-monitor-0.3.0.vsix
 ```
 
-VS Code penceresini yenile (Developer: Reload Window).
+Reload the window (Developer: Reload Window).
 
-## Ayarlar
+## Settings (`claudeSessionMonitor.*`)
 
-| Ayar | Varsayılan | Açıklama |
-|------|-----------|----------|
-| `claudeSessionMonitor.notifyOnWaiting` | `true` | "seni bekliyor" geçişinde bildirim |
-| `claudeSessionMonitor.notifyOnLimited` | `true` | limit geçişinde bildirim |
-| `claudeSessionMonitor.notifyOnDone` | `false` | "turn bitti" geçişinde bildirim |
-| `claudeSessionMonitor.pollIntervalMs` | `1500` | yenileme aralığı |
-| `claudeSessionMonitor.recentScanMaxAgeHours` | `6` | son N saatte aktif oturumları göster |
-| `claudeSessionMonitor.hideEndedAfterMinutes` | `30` | kapanan oturumları gizle |
-| `claudeSessionMonitor.workspaceOnly` | `false` | sadece bu workspace oturumları |
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `notifyOnWaiting` | `true` | Notify on transition to waiting-for-you |
+| `notifyOnLimited` | `true` | Notify on transition to limited |
+| `notifyOnDone` | `false` | Notify when a session finishes its turn |
+| `nativeNotifications` | `true` | Native macOS notification on limit/waiting |
+| `stuckAlertMinutes` | `5` | Alert when a working session is silent this long (0 = off) |
+| `cpuHogThreshold` | `60` | CPU% above which a session is flagged 🔥 |
+| `resourceSampleMs` | `3000` | CPU/RAM sampling interval |
+| `pollIntervalMs` | `1500` | Status refresh interval |
+| `recentScanMaxAgeHours` | `6` | Show sessions active within the last N hours |
+| `hideEndedAfterMinutes` | `30` | Hide ended sessions after this long |
+| `workspaceOnly` | `false` | Only show this workspace's sessions |
 
-## Geliştirme
+## Development
 
 ```bash
 npm run watch     # esbuild --watch
-npm run verify    # core veri katmanını gerçek transcript'lere karşı çalıştır
+npm run verify    # run the core data layer against real transcripts
 ```
 
-## Lisans
+## License
 
 MIT
