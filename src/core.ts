@@ -749,3 +749,140 @@ export function pruneLimitsHistory(maxLines = 3000): void {
     // ignore
   }
 }
+
+// ---------------------------------------------------------------------------
+// Token usage windows (rolling 5h / 7d) from transcripts.
+//
+// Real proxy for "how hard am I using Claude" since the official 5h/7d limit %
+// is not exposed to extensions in the VS Code app. Sums message.usage tokens
+// into hourly buckets. Incremental: each transcript's byte offset is persisted
+// so only newly appended bytes are read after the first (bounded) backfill.
+// ---------------------------------------------------------------------------
+
+export const TOKEN_OFFSETS = path.join(MONITOR_DIR, "token-offsets.json");
+export const TOKEN_BUCKETS = path.join(MONITOR_DIR, "token-buckets.json");
+const BACKFILL_CAP = 4 * 1024 * 1024; // first-pass per-file tail cap
+const SCAN_BYTE_BUDGET = 30 * 1024 * 1024; // max bytes read per scan call (backfill spreads over ticks)
+
+export interface TokenUsage {
+  fiveHour: number;
+  sevenDay: number;
+  hourly: { hour: number; tokens: number }[]; // last 48 hourly buckets
+}
+
+function tokensOfLine(obj: any): number {
+  const u = obj?.message?.usage;
+  if (!u) return 0;
+  // input + output + cache-write. cache_read is excluded: it is huge and counts
+  // minimally toward limits, so including it would drown out the real signal.
+  return (u.input_tokens || 0) + (u.output_tokens || 0) + (u.cache_creation_input_tokens || 0);
+}
+
+function readJson<T>(file: string, fallback: T): T {
+  try {
+    return JSON.parse(fs.readFileSync(file, "utf8")) as T;
+  } catch {
+    return fallback;
+  }
+}
+
+export function scanTokenUsage(
+  transcripts: { path: string }[],
+  now: number,
+  maxBytesPerCall = SCAN_BYTE_BUDGET,
+): TokenUsage {
+  const offsets = readJson<Record<string, { offset: number; size: number }>>(TOKEN_OFFSETS, {});
+  const buckets = readJson<Record<string, number>>(TOKEN_BUCKETS, {});
+  let bytesRead = 0;
+
+  for (const t of transcripts) {
+    let st: fs.Stats;
+    try {
+      st = fs.statSync(t.path);
+    } catch {
+      continue;
+    }
+    const prev = offsets[t.path];
+    let start = prev ? prev.offset : Math.max(0, st.size - BACKFILL_CAP);
+    if (prev && st.size < prev.size) start = Math.max(0, st.size - BACKFILL_CAP); // rotated/truncated
+    if (start >= st.size) {
+      offsets[t.path] = { offset: st.size, size: st.size };
+      continue;
+    }
+    if (bytesRead > maxBytesPerCall) break; // resume remaining files next call (offsets persist)
+    bytesRead += st.size - start;
+
+    let chunk = "";
+    try {
+      const fd = fs.openSync(t.path, "r");
+      try {
+        const len = st.size - start;
+        const buf = Buffer.alloc(len);
+        fs.readSync(fd, buf, 0, len, start);
+        chunk = buf.toString("utf8");
+      } finally {
+        fs.closeSync(fd);
+      }
+    } catch {
+      continue;
+    }
+
+    const lastNl = chunk.lastIndexOf("\n");
+    if (lastNl < 0) {
+      offsets[t.path] = { offset: start, size: st.size }; // wait for a complete line
+      continue;
+    }
+    const body = chunk.slice(0, lastNl);
+    const consumed = lastNl + 1;
+    const lines = body.split("\n");
+    const startIdx = !prev && start > 0 ? 1 : 0; // drop partial first line on backfill
+
+    for (let i = startIdx; i < lines.length; i++) {
+      const s = lines[i].trim();
+      if (!s) continue;
+      let obj: any;
+      try {
+        obj = JSON.parse(s);
+      } catch {
+        continue;
+      }
+      if (obj.type !== "assistant") continue;
+      const tok = tokensOfLine(obj);
+      if (!tok) continue;
+      const ms = Date.parse(obj.timestamp);
+      if (!Number.isFinite(ms)) continue;
+      const hour = Math.floor(ms / 1000 / 3600);
+      buckets[hour] = (buckets[hour] || 0) + tok;
+    }
+    offsets[t.path] = { offset: start + consumed, size: st.size };
+  }
+
+  const cutoffHour = Math.floor((now - 8 * 86400) / 3600);
+  for (const k of Object.keys(buckets)) if (parseInt(k, 10) < cutoffHour) delete buckets[k];
+
+  try {
+    fs.writeFileSync(TOKEN_OFFSETS, JSON.stringify(offsets));
+  } catch {
+    /* ignore */
+  }
+  try {
+    fs.writeFileSync(TOKEN_BUCKETS, JSON.stringify(buckets));
+  } catch {
+    /* ignore */
+  }
+
+  const nowHour = Math.floor(now / 3600);
+  const fiveCutHour = Math.floor((now - 5 * 3600) / 3600);
+  const sevenCutHour = Math.floor((now - 7 * 86400) / 3600);
+  let fiveHour = 0;
+  let sevenDay = 0;
+  for (const [k, v] of Object.entries(buckets)) {
+    const hr = parseInt(k, 10);
+    if (hr >= fiveCutHour) fiveHour += v;
+    if (hr >= sevenCutHour) sevenDay += v;
+  }
+  const hourly: { hour: number; tokens: number }[] = [];
+  for (let hr = nowHour - 47; hr <= nowHour; hr++) hourly.push({ hour: hr, tokens: buckets[hr] || 0 });
+
+  return { fiveHour, sevenDay, hourly };
+}

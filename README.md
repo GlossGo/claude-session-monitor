@@ -32,9 +32,18 @@ best-effort **jump to that session's tab** (falls back to opening the transcript
 
 ### Usage limits (webview)
 
-Gauges for the **5-hour** and **7-day** account limits (and 7-day Sonnet if present)
-with percent used, color (green/yellow/red), a "resets in Xh Ym" countdown, and a
-usage sparkline over time.
+- **Token usage** (real proxy): rolling **last 5h** and **last 7d** token totals
+  (input + output + cache-write, excluding cheap cache-read) computed from your
+  transcripts, with an hourly bar chart over the last 48h. This is the proactive
+  "how hard am I using Claude" gauge.
+- **Active limit hits** (reactive): the moment any session actually hits a
+  session/rate limit (a 429 in its transcript), it appears here with a live reset
+  countdown.
+- **Official 5h/7d %**: shown as gauges **only** when a terminal status line feeds
+  `limits.json`. Claude Code does not run the status line command in the VS Code
+  app (agent view), and `rate_limits` lives only in the app's memory, so the
+  official percentage is not available to extensions in VS Code. The token-usage
+  proxy above covers that gap.
 
 ## How it works
 

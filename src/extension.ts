@@ -26,12 +26,14 @@ import {
   readLimitsHistory,
   pruneLimitsHistory,
   parseResetToEpoch,
+  scanTokenUsage,
   MONITOR_DIR,
   PROJECTS_DIR,
   DEFAULT_ENTRYPOINTS,
   type SessionView,
   type RecentTranscript,
   type TxInfo,
+  type TokenUsage,
 } from "./core";
 
 type GroupKey = "limited" | "waiting" | "done" | "working" | "ended" | "unknown";
@@ -201,6 +203,7 @@ interface LimitsPayload {
   gauges: Gauge[];
   history: { t: number; fh: number | null; sd: number | null }[];
   limited: LimitedHit[]; // reactive: sessions that actually hit a limit (from transcripts)
+  tokens: TokenUsage | null; // rolling 5h / 7d token usage (proxy for limit pressure)
 }
 
 function normPct(u: unknown): number | null {
@@ -217,7 +220,7 @@ function normResetMs(r: unknown): number | null {
   return null;
 }
 
-function buildLimitsPayload(views: SessionView[]): LimitsPayload {
+function buildLimitsPayload(views: SessionView[], tokens: TokenUsage | null): LimitsPayload {
   const now = Date.now() / 1000;
   const lim = readLimits();
   const gauges: Gauge[] = [];
@@ -244,7 +247,7 @@ function buildLimitsPayload(views: SessionView[]): LimitsPayload {
       const e = v.resetText ? parseResetToEpoch(v.resetText, now) : undefined;
       return { title: v.title, sub: v.sub, resetText: v.resetText, resetMs: e ? e * 1000 : null };
     });
-  return { type: "update", ts: lim?.ts ?? null, model: lim?.model ?? null, official, gauges, history, limited };
+  return { type: "update", ts: lim?.ts ?? null, model: lim?.model ?? null, official, gauges, history, limited, tokens };
 }
 
 class LimitsView implements vscode.WebviewViewProvider {
@@ -334,6 +337,25 @@ function spark(history){
     + '</svg><div class="legend"><span><span class="dot" style="background:'+C_BLUE+'"></span>5-hour</span>'
     + '<span><span class="dot" style="background:'+C_WARN+'"></span>7-day</span></div></div>';
 }
+function fmtTokens(n){
+  if(n==null) return '0';
+  if(n<1000) return ''+Math.round(n);
+  if(n<1e6) return (n/1e3).toFixed(n<1e4?1:0)+'K';
+  return (n/1e6).toFixed(2)+'M';
+}
+function tokenSection(t){
+  if(!t) return '';
+  const hrs = t.hourly||[];
+  const max = Math.max(1, ...hrs.map(h=>h.tokens||0));
+  const W=300,H=40,n=hrs.length||1, bw=W/n;
+  let bars='';
+  hrs.forEach((h,i)=>{ const bh=(h.tokens/max)*(H-2); bars+='<rect x="'+(i*bw).toFixed(1)+'" y="'+(H-bh).toFixed(1)+'" width="'+(bw*0.8).toFixed(1)+'" height="'+Math.max(0,bh).toFixed(1)+'" fill="'+C_BLUE+'"/>'; });
+  return '<div class="sec"><h4>Token usage (in + out + cache-write)</h4>'
+    + '<div class="grow"><span class="glabel">Last 5h</span><span class="gpct">'+fmtTokens(t.fiveHour)+'</span></div>'
+    + '<div class="grow"><span class="glabel">Last 7d</span><span class="gpct">'+fmtTokens(t.sevenDay)+'</span></div>'
+    + '<svg viewBox="0 0 '+W+' '+H+'" preserveAspectRatio="none">'+bars+'</svg>'
+    + '<div class="legend"><span>hourly, last 48h</span></div></div>';
+}
 function render(){
   const root = document.getElementById('root');
   if(!last){ return; }
@@ -355,6 +377,8 @@ function render(){
       h += '<div class="foot">'+(last.model?esc(last.model)+' · ':'')+(age!=null? 'updated '+age+'s ago':'')+'</div>';
     }
   }
+  // Token usage (real proxy; always shown when available).
+  h += tokenSection(last.tokens);
   // Reactive limit hits: always real, derived from session transcripts (429).
   if(last.limited && last.limited.length){
     h += '<div class="sec"><h4>Active limit hits</h4>';
@@ -414,6 +438,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
   let lastRecentScan = 0;
   let lastCleanup = 0;
   let lastResourceSample = 0;
+  let lastTokenScan = 0;
+  let tokenUsage: TokenUsage | null = null;
   let firstPaintDone = false;
   let needsYouOnly = false;
   let workspaceOnlyOverride: boolean | undefined;
@@ -442,6 +468,16 @@ export function activate(ctx: vscode.ExtensionContext): void {
       lastCleanup = now;
     }
 
+    if (now - lastTokenScan > 60) {
+      lastTokenScan = now;
+      try {
+        const tx7 = findRecentTranscripts(7 * 86400 * 1000, 400, now);
+        tokenUsage = scanTokenUsage(tx7, now);
+      } catch {
+        /* ignore */
+      }
+    }
+
     const wsOnly =
       workspaceOnlyOverride !== undefined ? workspaceOnlyOverride : c.get<boolean>("workspaceOnly", false);
 
@@ -467,7 +503,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     updateStatusBar(statusBar, views, resourceCache);
     updateAux(treeView, views, resourceCache, needsYouOnly);
     try {
-      limitsView.update(buildLimitsPayload(views));
+      limitsView.update(buildLimitsPayload(views, tokenUsage));
     } catch {
       /* ignore */
     }
