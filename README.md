@@ -39,11 +39,13 @@ best-effort **jump to that session's tab** (falls back to opening the transcript
 - **Active limit hits** (reactive): the moment any session actually hits a
   session/rate limit (a 429 in its transcript), it appears here with a live reset
   countdown.
-- **Official 5h/7d %**: shown as gauges **only** when a terminal status line feeds
-  `limits.json`. Claude Code does not run the status line command in the VS Code
-  app (agent view), and `rate_limits` lives only in the app's memory, so the
-  official percentage is not available to extensions in VS Code. The token-usage
-  proxy above covers that gap.
+- **Official Session (5h) + Weekly (7d) usage**: segmented gauges with **% used**,
+  **% left**, and a reset countdown, fetched from `api.anthropic.com/api/oauth/usage`
+  using your Claude OAuth token from the macOS keychain (`Claude Code-credentials`).
+  Read-only GET of your own account usage (the same source the Claude Usage Bar
+  extension uses), refreshed every ~90s. First access may prompt for keychain
+  permission ("Always Allow"). Falls back to a terminal status line's `limits.json`,
+  then to the token-usage proxy, if unavailable.
 
 ## How it works
 
