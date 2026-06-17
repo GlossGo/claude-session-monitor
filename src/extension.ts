@@ -15,7 +15,9 @@
  */
 import * as vscode from "vscode";
 import * as fs from "fs";
-import { execFile } from "child_process";
+import * as os from "os";
+import * as https from "https";
+import { execFile, execFileSync } from "child_process";
 import {
   collectSessions,
   countBuckets,
@@ -220,21 +222,128 @@ function normResetMs(r: unknown): number | null {
   return null;
 }
 
-function buildLimitsPayload(views: SessionView[], tokens: TokenUsage | null): LimitsPayload {
-  const now = Date.now() / 1000;
-  const lim = readLimits();
-  const gauges: Gauge[] = [];
-  if (lim) {
-    gauges.push({ key: "5h", label: "5-hour", pct: normPct(lim.fh), resetMs: normResetMs(lim.fh_reset) });
-    gauges.push({ key: "7d", label: "7-day", pct: normPct(lim.sd), resetMs: normResetMs(lim.sd_reset) });
-    if (lim.sds != null)
-      gauges.push({
-        key: "7d-sonnet",
-        label: "7-day (Sonnet)",
-        pct: normPct(lim.sds),
-        resetMs: normResetMs(lim.sds_reset),
-      });
+// ---------------------------------------------------------------------------
+// Official account usage (5h / 7d) via api.anthropic.com/api/oauth/usage.
+// Same source the "Claude Usage Bar" extension uses: the OAuth token from the
+// macOS keychain item "Claude Code-credentials". Read-only GET of your own
+// account usage; no data leaves to anywhere but Anthropic's usage endpoint.
+// ---------------------------------------------------------------------------
+
+interface OfficialLimit {
+  pct: number;
+  resetMs: number | null;
+}
+interface OfficialUsage {
+  fiveHour?: OfficialLimit;
+  sevenDay?: OfficialLimit;
+  sevenDaySonnet?: OfficialLimit;
+  ts: number;
+}
+
+function readClaudeToken(): string | undefined {
+  if (process.platform !== "darwin") return undefined;
+  try {
+    const user = process.env.USER || os.userInfo().username || "";
+    const raw = execFileSync(
+      "security",
+      ["find-generic-password", "-a", user, "-w", "-s", "Claude Code-credentials"],
+      { encoding: "utf-8", timeout: 5000 },
+    ).trim();
+    const creds = JSON.parse(raw);
+    return creds?.claudeAiOauth?.accessToken;
+  } catch {
+    return undefined;
   }
+}
+
+function fetchOfficialUsage(cb: (u: OfficialUsage | null) => void): void {
+  let token: string | undefined;
+  try {
+    token = readClaudeToken();
+  } catch {
+    token = undefined;
+  }
+  if (!token) {
+    cb(null);
+    return;
+  }
+  const req = https.request(
+    {
+      hostname: "api.anthropic.com",
+      path: "/api/oauth/usage",
+      method: "GET",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${token}`,
+        "anthropic-beta": "oauth-2025-04-20",
+      },
+      timeout: 8000,
+    },
+    (res) => {
+      let body = "";
+      res.on("data", (c) => {
+        if (body.length < 200000) body += c;
+      });
+      res.on("end", () => {
+        try {
+          if (res.statusCode !== 200) {
+            cb(null);
+            return;
+          }
+          const p: any = JSON.parse(body);
+          const mk = (o: any): OfficialLimit | undefined =>
+            o && o.utilization != null ? { pct: normPct(o.utilization) ?? 0, resetMs: normResetMs(o.resets_at) } : undefined;
+          cb({
+            fiveHour: mk(p.five_hour),
+            sevenDay: mk(p.seven_day),
+            sevenDaySonnet: mk(p.seven_day_sonnet),
+            ts: Date.now() / 1000,
+          });
+        } catch {
+          cb(null);
+        }
+      });
+    },
+  );
+  req.on("error", () => cb(null));
+  req.on("timeout", () => {
+    req.destroy();
+    cb(null);
+  });
+  req.end();
+}
+
+function buildLimitsPayload(
+  views: SessionView[],
+  tokens: TokenUsage | null,
+  officialUsage: OfficialUsage | null,
+): LimitsPayload {
+  const now = Date.now() / 1000;
+  const gauges: Gauge[] = [];
+  let model: string | null = null;
+  let ts: number | null = null;
+
+  if (officialUsage && (officialUsage.fiveHour || officialUsage.sevenDay)) {
+    ts = officialUsage.ts;
+    if (officialUsage.fiveHour)
+      gauges.push({ key: "5h", label: "Session (5h)", pct: officialUsage.fiveHour.pct, resetMs: officialUsage.fiveHour.resetMs });
+    if (officialUsage.sevenDay)
+      gauges.push({ key: "7d", label: "Weekly (7d)", pct: officialUsage.sevenDay.pct, resetMs: officialUsage.sevenDay.resetMs });
+    if (officialUsage.sevenDaySonnet)
+      gauges.push({ key: "7d-sonnet", label: "Weekly · Sonnet", pct: officialUsage.sevenDaySonnet.pct, resetMs: officialUsage.sevenDaySonnet.resetMs });
+  } else {
+    // Fallback: limits.json written by a terminal status line (if present).
+    const lim = readLimits();
+    if (lim) {
+      ts = lim.ts ?? null;
+      model = lim.model ?? null;
+      gauges.push({ key: "5h", label: "Session (5h)", pct: normPct(lim.fh), resetMs: normResetMs(lim.fh_reset) });
+      gauges.push({ key: "7d", label: "Weekly (7d)", pct: normPct(lim.sd), resetMs: normResetMs(lim.sd_reset) });
+      if (lim.sds != null)
+        gauges.push({ key: "7d-sonnet", label: "Weekly · Sonnet", pct: normPct(lim.sds), resetMs: normResetMs(lim.sds_reset) });
+    }
+  }
+
   const official = gauges.some((g) => g.pct != null);
   const history = readLimitsHistory(240).map((p) => ({
     t: typeof p.ts === "number" ? p.ts * 1000 : 0,
@@ -247,7 +356,7 @@ function buildLimitsPayload(views: SessionView[], tokens: TokenUsage | null): Li
       const e = v.resetText ? parseResetToEpoch(v.resetText, now) : undefined;
       return { title: v.title, sub: v.sub, resetText: v.resetText, resetMs: e ? e * 1000 : null };
     });
-  return { type: "update", ts: lim?.ts ?? null, model: lim?.model ?? null, official, gauges, history, limited, tokens };
+  return { type: "update", ts, model, official, gauges, history, limited, tokens };
 }
 
 class LimitsView implements vscode.WebviewViewProvider {
@@ -288,6 +397,8 @@ function limitsHtml(): string {
   .greset { opacity:.7; font-size:11px; }
   .bar { height:8px; border-radius:4px; background: var(--vscode-editorWidget-background, rgba(127,127,127,.18)); overflow:hidden; }
   .fill { height:100%; border-radius:4px; transition: width .4s ease; }
+  .segs { display:flex; gap:3px; margin:3px 0; }
+  .seg { flex:1; height:9px; border-radius:2px; background: var(--vscode-editorWidget-background, rgba(127,127,127,.2)); }
   .spark { margin-top:8px; }
   .spark h4 { margin:0 0 4px 0; font-size:11px; opacity:.7; font-weight:600; }
   .legend { font-size:11px; opacity:.7; display:flex; gap:12px; margin-top:2px; }
@@ -316,7 +427,8 @@ function fmtLeft(ms){
   if(ms==null) return '';
   let s = Math.round((ms - Date.now())/1000);
   if(s<=0) return 'resets now';
-  const h=Math.floor(s/3600), m=Math.floor((s%3600)/60);
+  const d=Math.floor(s/86400), h=Math.floor((s%86400)/3600), m=Math.floor((s%3600)/60);
+  if(d>0) return 'resets in '+d+'d '+h+'h';
   if(h>0) return 'resets in '+h+'h '+m+'m';
   if(m>0) return 'resets in '+m+'m';
   return 'resets in <1m';
@@ -364,17 +476,19 @@ function render(){
   if(last.official){
     for(const g of last.gauges){
       const p = g.pct;
-      const pctTxt = p==null ? '—' : Math.round(p)+'%';
-      const w = p==null ? 0 : Math.max(2, Math.min(100, p));
+      const used = p==null ? 0 : Math.round(p);
+      const left = p==null ? 100 : Math.max(0, 100 - used);
+      const filled = p==null ? 0 : Math.max(0, Math.min(10, Math.round(p/10)));
+      let segs='';
+      for(let i=0;i<10;i++) segs += '<div class="seg" style="'+(i<filled?('background:'+color(p)):'')+'"></div>';
       h += '<div class="gauge"><div class="grow"><span class="glabel">'+esc(g.label)+'</span>'
-         + '<span class="gpct">'+pctTxt+'</span></div>'
-         + '<div class="bar"><div class="fill" style="width:'+w+'%;background:'+color(p)+'"></div></div>'
-         + '<div class="greset">'+fmtLeft(g.resetMs)+'</div></div>';
+         + '<span class="gpct">'+used+'% used</span></div>'
+         + '<div class="segs">'+segs+'</div>'
+         + '<div class="greset"><b>'+left+'% left</b>'+(g.resetMs?(' · '+fmtLeft(g.resetMs)):'')+'</div></div>';
     }
-    h += spark(last.history);
-    if(last.model || last.ts){
-      const age = last.ts ? Math.round(Date.now()/1000 - last.ts) : null;
-      h += '<div class="foot">'+(last.model?esc(last.model)+' · ':'')+(age!=null? 'updated '+age+'s ago':'')+'</div>';
+    if(last.ts){
+      const age = Math.round(Date.now()/1000 - last.ts);
+      h += '<div class="foot">official account usage · updated '+age+'s ago</div>';
     }
   }
   // Token usage (real proxy; always shown when available).
@@ -390,10 +504,7 @@ function render(){
   }
   // Honest note when the official live gauges are unavailable (VS Code app mode).
   if(!last.official){
-    if(!last.limited || !last.limited.length){
-      h += '<div class="empty">No active limits right now.</div>';
-    }
-    h += '<div class="note">Live 5h / 7-day usage % is not exposed to extensions in the VS Code Claude app (only the terminal status line reports it). Sessions show up here the instant they hit a limit, with the reset countdown.</div>';
+    h += '<div class="note">Official 5h / 7d usage unavailable (needs macOS keychain access to "Claude Code-credentials" + network). The token-usage proxy below still works; sessions also appear under "Active limit hits" the moment they hit a limit.</div>';
   }
   root.innerHTML = h;
 }
@@ -440,6 +551,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
   let lastResourceSample = 0;
   let lastTokenScan = 0;
   let tokenUsage: TokenUsage | null = null;
+  let officialUsage: OfficialUsage | null = null;
+  let lastUsageFetch = 0;
   let firstPaintDone = false;
   let needsYouOnly = false;
   let workspaceOnlyOverride: boolean | undefined;
@@ -478,6 +591,18 @@ export function activate(ctx: vscode.ExtensionContext): void {
       }
     }
 
+    if (now - lastUsageFetch > 90) {
+      lastUsageFetch = now;
+      fetchOfficialUsage((u) => {
+        if (u) officialUsage = u;
+        try {
+          limitsView.update(buildLimitsPayload(lastViews, tokenUsage, officialUsage));
+        } catch {
+          /* ignore */
+        }
+      });
+    }
+
     const wsOnly =
       workspaceOnlyOverride !== undefined ? workspaceOnlyOverride : c.get<boolean>("workspaceOnly", false);
 
@@ -503,7 +628,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     updateStatusBar(statusBar, views, resourceCache);
     updateAux(treeView, views, resourceCache, needsYouOnly);
     try {
-      limitsView.update(buildLimitsPayload(views, tokenUsage));
+      limitsView.update(buildLimitsPayload(views, tokenUsage, officialUsage));
     } catch {
       /* ignore */
     }
