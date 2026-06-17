@@ -55,6 +55,7 @@ export interface HookStatus {
   source?: string;
   stop_reason?: string;
   reason?: string;
+  pid?: number;
 }
 
 export interface LimitInfo {
@@ -93,6 +94,7 @@ export interface SessionView {
   permissionMode?: string;
   notifMessage?: string;
   entrypoint?: string;
+  pid?: number;
   stale: boolean;
 }
 
@@ -400,7 +402,7 @@ function resolve(
 
   const ageStr = lastActivity ? humanizeAge(now - lastActivity) : "";
   const parts: string[] = [];
-  if (resetText) parts.push(`reset ${resetText}`);
+  if (resetText) parts.push(`reset ${formatReset(resetText, now)}`);
   if (ageStr) parts.push(ageStr);
   if (cwdLabel) parts.push(cwdLabel);
   const detail = parts.join(" · ");
@@ -412,7 +414,7 @@ function resolve(
     entrypoint ? `kaynak: ${entrypoint}` : "",
     hook?.permission_mode ? `mod: ${hook.permission_mode}` : "",
     hook?.message ? `bildirim: ${hook.message}` : "",
-    resetText ? `limit reset: ${resetText}` : "",
+    resetText ? `limit reset: ${formatReset(resetText, now)}` : "",
     lastActivity ? `son aktivite: ${ageStr} önce` : "",
     `id: ${sessionId}`,
   ].filter(Boolean);
@@ -432,6 +434,7 @@ function resolve(
     permissionMode: hook?.permission_mode,
     notifMessage: hook?.message,
     entrypoint,
+    pid: hook?.pid,
     stale,
   };
 }
@@ -442,6 +445,32 @@ export function humanizeAge(seconds: number): string {
   if (seconds < 3600) return `${Math.floor(seconds / 60)}dk`;
   if (seconds < 86400) return `${Math.floor(seconds / 3600)}sa`;
   return `${Math.floor(seconds / 86400)}g`;
+}
+
+/** Parse a limit reset clock like "1:50pm" / "1:50am" / "13:50" to epoch sec. */
+export function parseResetToEpoch(resetText: string, nowSec: number): number | undefined {
+  const m = resetText.match(/(\d{1,2}):(\d{2})\s*(am|pm)?/i);
+  if (!m) return undefined;
+  let h = parseInt(m[1], 10);
+  const min = parseInt(m[2], 10);
+  const ap = m[3]?.toLowerCase();
+  if (ap === "pm" && h < 12) h += 12;
+  if (ap === "am" && h === 12) h = 0;
+  if (h > 23 || min > 59) return undefined;
+  const now = new Date(nowSec * 1000);
+  const d = new Date(now.getFullYear(), now.getMonth(), now.getDate(), h, min, 0, 0);
+  let t = d.getTime() / 1000;
+  if (t < nowSec - 60) t += 24 * 3600; // already passed -> assume next day
+  return t;
+}
+
+/** "1:50pm (12dk kaldı)" style live countdown; falls back to the raw text. */
+export function formatReset(resetText: string, nowSec: number): string {
+  const t = parseResetToEpoch(resetText, nowSec);
+  if (!t) return resetText;
+  const remain = t - nowSec;
+  if (remain <= 0) return `${resetText} (şimdi)`;
+  return `${resetText} (${humanizeAge(remain)} kaldı)`;
 }
 
 // ---------------------------------------------------------------------------

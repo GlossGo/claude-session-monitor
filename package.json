@@ -2,7 +2,7 @@
   "name": "claude-session-monitor",
   "displayName": "Claude Session Monitor",
   "description": "Tüm Claude Code oturumlarını canlı izle: hangisi çalışıyor, hangisi seni bekliyor, hangisi limite takıldı.",
-  "version": "0.1.1",
+  "version": "0.2.0",
   "publisher": "softween",
   "license": "MIT",
   "repository": {
@@ -57,6 +57,11 @@
         "icon": "$(filter)"
       },
       {
+        "command": "claudeSessionMonitor.toggleNeedsYouOnly",
+        "title": "Claude Oturumları: Sadece Seni Bekleyenler",
+        "icon": "$(bell)"
+      },
+      {
         "command": "claudeSessionMonitor.clearEnded",
         "title": "Claude Oturumları: Kapananları Temizle",
         "icon": "$(clear-all)"
@@ -64,6 +69,11 @@
     ],
     "menus": {
       "view/title": [
+        {
+          "command": "claudeSessionMonitor.toggleNeedsYouOnly",
+          "when": "view == claudeSessionMonitor.view",
+          "group": "navigation@0"
+        },
         {
           "command": "claudeSessionMonitor.toggleWorkspaceOnly",
           "when": "view == claudeSessionMonitor.view",
@@ -126,6 +136,26 @@
           "type": "boolean",
           "default": false,
           "description": "Sadece bu VS Code workspace'ine ait oturumları göster."
+        },
+        "claudeSessionMonitor.nativeNotifications": {
+          "type": "boolean",
+          "default": true,
+          "description": "Limit/bekleme geçişlerinde native macOS bildirimi göster (VS Code odakta değilken bile)."
+        },
+        "claudeSessionMonitor.stuckAlertMinutes": {
+          "type": "number",
+          "default": 5,
+          "description": "Çalışan bir oturum bu kadar dakika sessiz kalırsa 'takılmış olabilir' uyarısı (0 = kapalı)."
+        },
+        "claudeSessionMonitor.resourceSampleMs": {
+          "type": "number",
+          "default": 3000,
+          "description": "CPU/RAM örnekleme aralığı (ms)."
+        },
+        "claudeSessionMonitor.cpuHogThreshold": {
+          "type": "number",
+          "default": 60,
+          "description": "Bu CPU%'nin üstündeki oturumlar ateş ikonuyla işaretlenir."
         }
       }
     }
