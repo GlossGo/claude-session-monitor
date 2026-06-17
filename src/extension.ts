@@ -704,23 +704,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
       refresh();
     }),
     vscode.commands.registerCommand("claudeSessionMonitor.dumpTabs", () => {
-      const dbg: any = { ts: new Date().toISOString(), groups: [] };
-      const groups = vscode.window.tabGroups.all;
-      groups.forEach((g, gi) => {
-        dbg.groups.push({
-          groupIndex: gi,
-          active: g.isActive,
-          tabs: g.tabs.map((t, ti) => ({
-            i: ti,
-            label: t.label,
-            active: t.isActive,
-            kind: (t.input && (t.input as any).constructor && (t.input as any).constructor.name) || typeof t.input,
-            viewType: (t.input as any)?.viewType,
-          })),
-        });
-      });
-      writeTabDebug(dbg);
-      const total = dbg.groups.reduce((n: number, g: any) => n + g.tabs.length, 0);
+      const total = dumpTabsTo(`${MONITOR_DIR}/tabs-debug.json`);
       vscode.window.showInformationMessage(
         `Claude Sessions: wrote ${total} tabs to ~/.claude/session-monitor/tabs-debug.json`,
       );
@@ -735,29 +719,86 @@ export function activate(ctx: vscode.ExtensionContext): void {
         return;
       }
       stopResume();
-      const stagger = Math.max(5, cfg().get<number>("resumeStaggerSeconds", 60));
+      const c = cfg();
+      const stagger = Math.max(5, c.get<number>("resumeStaggerSeconds", 60));
+      const auto = c.get<boolean>("resumeAutoType", true);
+      const prompt = c.get<string>("resumePrompt", "resume");
       let i = 0;
+      let typed = 0;
+      let skipped = 0;
+
       const step = async () => {
         if (i >= queue.length) {
-          stopResume(`Claude Sessions: resume sweep done (${queue.length}).`);
+          stopResume(
+            auto
+              ? `Claude Sessions: resume sweep done · typed ${typed}, skipped ${skipped}.`
+              : `Claude Sessions: resume sweep done (${queue.length}).`,
+          );
           return;
         }
         const v = queue[i++];
         await jumpToSession(v);
+        await sleep(500);
+
+        if (!auto) {
+          try {
+            await vscode.commands.executeCommand("claude-vscode.focus");
+          } catch {
+            /* ignore */
+          }
+          const tail = i < queue.length ? ` (next in ${stagger}s)` : " (last)";
+          vscode.window
+            .showInformationMessage(`Resume ${i}/${queue.length}: "${truncate(v.title, 40)}" · press Enter${tail}`, "Stop")
+            .then((x) => {
+              if (x === "Stop") stopResume("Claude Sessions: resume sweep stopped.");
+            });
+          return;
+        }
+
+        // Auto-type: only when the target tab is verified active (never type into the wrong place).
+        const a = activeTabLabel();
+        if (!a || !labelsMatch(a, v.title)) {
+          skipped++;
+          return;
+        }
         try {
           await vscode.commands.executeCommand("claude-vscode.focus");
         } catch {
           /* ignore */
         }
-        const tail = i < queue.length ? ` (next in ${stagger}s)` : " (last)";
-        vscode.window
-          .showInformationMessage(`Resume ${i}/${queue.length}: "${truncate(v.title, 40)}" · press Enter${tail}`, "Stop")
-          .then((c) => {
-            if (c === "Stop") stopResume("Claude Sessions: resume sweep stopped.");
-          });
+        await activateEditorApp();
+        await sleep(150);
+        try {
+          await vscode.commands.executeCommand("claude-vscode.focus");
+        } catch {
+          /* ignore */
+        }
+        await sleep(220);
+        const r = await typeAndSubmit(prompt);
+        if (!r.ok) {
+          if (/not allowed|assistive|accessibility|-1743|-25211|not permitted/i.test(r.err || "")) {
+            stopResume();
+            vscode.window
+              .showErrorMessage(
+                'Auto-resume needs Accessibility permission. Enable "Visual Studio Code" in System Settings > Privacy & Security > Accessibility, then run Resume All again.',
+                "Open Settings",
+              )
+              .then((x) => {
+                if (x === "Open Settings")
+                  execFile("open", ["x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"], () => {});
+              });
+            return;
+          }
+          skipped++;
+        } else {
+          typed++;
+        }
       };
+
       vscode.window.showInformationMessage(
-        `Claude Sessions: resuming ${queue.length} sessions, one every ${stagger}s. Press Enter in each focused session.`,
+        auto
+          ? `Claude Sessions: auto-resuming ${queue.length} sessions, one every ${stagger}s (typing "${prompt}" + Enter). Leave VS Code frontmost.`
+          : `Claude Sessions: resuming ${queue.length} sessions, one every ${stagger}s. Press Enter in each.`,
       );
       await step();
       resumeTimer = setInterval(step, stagger * 1000);
@@ -791,6 +832,16 @@ export function activate(ctx: vscode.ExtensionContext): void {
   const pollMs = Math.max(500, cfg().get<number>("pollIntervalMs", 1500));
   const interval = setInterval(refresh, pollMs);
   ctx.subscriptions.push({ dispose: () => clearInterval(interval) });
+
+  // One-shot tab dump a few seconds after startup so jump matching can be diagnosed.
+  const dumpTimer = setTimeout(() => {
+    try {
+      dumpTabsTo(`${MONITOR_DIR}/tabs-debug.json`);
+    } catch {
+      /* ignore */
+    }
+  }, 5000);
+  ctx.subscriptions.push({ dispose: () => clearTimeout(dumpTimer) });
 
   refresh();
 }
@@ -1115,4 +1166,60 @@ function debounce(fn: () => void, ms: number): () => void {
     if (t) clearTimeout(t);
     t = setTimeout(fn, ms);
   };
+}
+
+// --- OS-level keystroke helpers (macOS) for fully-automated resume ----------
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((r) => setTimeout(r, ms));
+}
+
+function activeTabLabel(): string | undefined {
+  return vscode.window.tabGroups.activeTabGroup?.activeTab?.label;
+}
+
+function activateEditorApp(): Promise<void> {
+  return new Promise((res) => {
+    execFile("osascript", ["-e", 'tell application "Visual Studio Code" to activate'], { timeout: 4000 }, () => res());
+  });
+}
+
+function appleStr(s: string): string {
+  return '"' + s.replace(/\\/g, "\\\\").replace(/"/g, '\\"') + '"';
+}
+
+/** Types `text` into the focused element and presses Return, via System Events. */
+function typeAndSubmit(text: string): Promise<{ ok: boolean; err?: string }> {
+  return new Promise((res) => {
+    const lines = ['tell application "System Events"', `keystroke ${appleStr(text)}`, "delay 0.15", "key code 36", "end tell"];
+    const args: string[] = [];
+    for (const l of lines) args.push("-e", l);
+    execFile("osascript", args, { timeout: 8000 }, (err, _o, stderr) => {
+      if (err) res({ ok: false, err: String(stderr || err) });
+      else res({ ok: true });
+    });
+  });
+}
+
+function dumpTabsTo(file: string): number {
+  const dbg: any = { ts: new Date().toISOString(), groups: [] };
+  vscode.window.tabGroups.all.forEach((g, gi) => {
+    dbg.groups.push({
+      groupIndex: gi,
+      active: g.isActive,
+      tabs: g.tabs.map((t, ti) => ({
+        i: ti,
+        label: t.label,
+        active: t.isActive,
+        kind: (t.input && (t.input as any).constructor && (t.input as any).constructor.name) || typeof t.input,
+        viewType: (t.input as any)?.viewType,
+      })),
+    });
+  });
+  try {
+    fs.writeFileSync(file, JSON.stringify(dbg, null, 2));
+  } catch {
+    /* ignore */
+  }
+  return dbg.groups.reduce((n: number, g: any) => n + g.tabs.length, 0);
 }

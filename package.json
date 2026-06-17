@@ -2,7 +2,7 @@
   "name": "claude-session-monitor",
   "displayName": "Claude Session Monitor",
   "description": "Live monitor for all your Claude Code sessions: which is working, which is waiting for you, which hit a limit, plus per-session CPU/RAM and 5h/7d usage limits.",
-  "version": "0.6.0",
+  "version": "0.7.0",
   "publisher": "softween",
   "license": "MIT",
   "repository": {
@@ -205,6 +205,16 @@
           "type": "number",
           "default": 60,
           "description": "Seconds between sessions during a staggered resume sweep (avoids hitting the rate limit by resuming all at once)."
+        },
+        "claudeSessionMonitor.resumeAutoType": {
+          "type": "boolean",
+          "default": true,
+          "description": "Auto-type the resume prompt and press Enter via macOS keystrokes (needs Accessibility permission for VS Code). If off, the sweep just focuses each session and you press Enter."
+        },
+        "claudeSessionMonitor.resumePrompt": {
+          "type": "string",
+          "default": "resume",
+          "description": "Text typed into each session during a resume sweep."
         }
       }
     }
