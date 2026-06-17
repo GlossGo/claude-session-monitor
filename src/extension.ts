@@ -149,7 +149,7 @@ class SessionTree implements vscode.TreeDataProvider<Node> {
 
     const resTip = res ? `\nCPU: ${Math.round(res.cpu)}%  RAM: ${res.rssMb}MB  (pid ${v.pid})` : "";
     item.tooltip = v.tooltip + resTip;
-    item.contextValue = "session";
+    item.contextValue = groupOf(v) === "ended" ? "session-ended" : "session";
     const g = GROUPS[GROUP_INDEX[groupOf(v)]];
     item.iconPath = new vscode.ThemeIcon(
       groupOf(v) === "working" && v.stale ? "warning" : g.icon,
@@ -556,6 +556,16 @@ export function activate(ctx: vscode.ExtensionContext): void {
   let firstPaintDone = false;
   let needsYouOnly = false;
   let workspaceOnlyOverride: boolean | undefined;
+  const dismissed = new Set<string>();
+  let resumeTimer: ReturnType<typeof setInterval> | undefined;
+
+  const stopResume = (msg?: string) => {
+    if (resumeTimer) {
+      clearInterval(resumeTimer);
+      resumeTimer = undefined;
+    }
+    if (msg) vscode.window.showInformationMessage(msg);
+  };
 
   function refresh(): void {
     const now = Date.now() / 1000;
@@ -621,6 +631,8 @@ export function activate(ctx: vscode.ExtensionContext): void {
       views = [];
     }
 
+    for (const v of views) if (dismissed.has(v.sessionId) && groupOf(v) !== "ended") dismissed.delete(v.sessionId);
+    if (dismissed.size) views = views.filter((v) => !dismissed.has(v.sessionId));
     if (needsYouOnly) views = views.filter((v) => NEEDS_YOU.includes(groupOf(v)));
     lastViews = views;
 
@@ -675,10 +687,80 @@ export function activate(ctx: vscode.ExtensionContext): void {
     }),
     vscode.commands.registerCommand("claudeSessionMonitor.clearEnded", () => {
       const now = Date.now() / 1000;
+      for (const v of lastViews) if (groupOf(v) === "ended") dismissed.add(v.sessionId);
       const removed = cleanupEndedMonitorFiles(now);
       vscode.window.showInformationMessage(`Claude Sessions: cleared ${removed} ended session(s).`);
       txCache.clear();
       refresh();
+    }),
+    vscode.commands.registerCommand("claudeSessionMonitor.removeSession", (v?: SessionView) => {
+      if (!v?.sessionId) return;
+      dismissed.add(v.sessionId);
+      try {
+        fs.unlinkSync(`${MONITOR_DIR}/${v.sessionId}.json`);
+      } catch {
+        /* may not exist */
+      }
+      refresh();
+    }),
+    vscode.commands.registerCommand("claudeSessionMonitor.dumpTabs", () => {
+      const dbg: any = { ts: new Date().toISOString(), groups: [] };
+      const groups = vscode.window.tabGroups.all;
+      groups.forEach((g, gi) => {
+        dbg.groups.push({
+          groupIndex: gi,
+          active: g.isActive,
+          tabs: g.tabs.map((t, ti) => ({
+            i: ti,
+            label: t.label,
+            active: t.isActive,
+            kind: (t.input && (t.input as any).constructor && (t.input as any).constructor.name) || typeof t.input,
+            viewType: (t.input as any)?.viewType,
+          })),
+        });
+      });
+      writeTabDebug(dbg);
+      const total = dbg.groups.reduce((n: number, g: any) => n + g.tabs.length, 0);
+      vscode.window.showInformationMessage(
+        `Claude Sessions: wrote ${total} tabs to ~/.claude/session-monitor/tabs-debug.json`,
+      );
+    }),
+    vscode.commands.registerCommand("claudeSessionMonitor.stopResumeAll", () =>
+      stopResume("Claude Sessions: resume sweep stopped."),
+    ),
+    vscode.commands.registerCommand("claudeSessionMonitor.resumeAll", async () => {
+      const queue = lastViews.filter((v) => groupOf(v) !== "ended");
+      if (!queue.length) {
+        vscode.window.showInformationMessage("Claude Sessions: no open sessions to resume.");
+        return;
+      }
+      stopResume();
+      const stagger = Math.max(5, cfg().get<number>("resumeStaggerSeconds", 60));
+      let i = 0;
+      const step = async () => {
+        if (i >= queue.length) {
+          stopResume(`Claude Sessions: resume sweep done (${queue.length}).`);
+          return;
+        }
+        const v = queue[i++];
+        await jumpToSession(v);
+        try {
+          await vscode.commands.executeCommand("claude-vscode.focus");
+        } catch {
+          /* ignore */
+        }
+        const tail = i < queue.length ? ` (next in ${stagger}s)` : " (last)";
+        vscode.window
+          .showInformationMessage(`Resume ${i}/${queue.length}: "${truncate(v.title, 40)}" · press Enter${tail}`, "Stop")
+          .then((c) => {
+            if (c === "Stop") stopResume("Claude Sessions: resume sweep stopped.");
+          });
+      };
+      vscode.window.showInformationMessage(
+        `Claude Sessions: resuming ${queue.length} sessions, one every ${stagger}s. Press Enter in each focused session.`,
+      );
+      await step();
+      resumeTimer = setInterval(step, stagger * 1000);
     }),
     vscode.commands.registerCommand("claudeSessionMonitor.openTranscript", (arg?: SessionView | Node) =>
       openTranscript(arg),
@@ -686,6 +768,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("claudeSessionMonitor.openSession", (v: SessionView) =>
       jumpToSession(v),
     ),
+    { dispose: () => stopResume() },
   );
 
   const debouncedRefresh = debounce(refresh, 200);

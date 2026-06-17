@@ -2,7 +2,7 @@
   "name": "claude-session-monitor",
   "displayName": "Claude Session Monitor",
   "description": "Live monitor for all your Claude Code sessions: which is working, which is waiting for you, which hit a limit, plus per-session CPU/RAM and 5h/7d usage limits.",
-  "version": "0.5.0",
+  "version": "0.6.0",
   "publisher": "softween",
   "license": "MIT",
   "repository": {
@@ -69,28 +69,62 @@
       {
         "command": "claudeSessionMonitor.clearEnded",
         "title": "Claude Sessions: Clear Ended",
-        "icon": "$(clear-all)"
+        "icon": "$(trash)"
+      },
+      {
+        "command": "claudeSessionMonitor.removeSession",
+        "title": "Remove from list",
+        "icon": "$(close)"
+      },
+      {
+        "command": "claudeSessionMonitor.resumeAll",
+        "title": "Claude Sessions: Resume All (staggered)",
+        "icon": "$(debug-restart)"
+      },
+      {
+        "command": "claudeSessionMonitor.stopResumeAll",
+        "title": "Claude Sessions: Stop Resume Sweep",
+        "icon": "$(debug-stop)"
+      },
+      {
+        "command": "claudeSessionMonitor.dumpTabs",
+        "title": "Claude Sessions: Dump Open Tabs (debug)"
       }
     ],
     "menus": {
       "view/title": [
         {
-          "command": "claudeSessionMonitor.toggleNeedsYouOnly",
+          "command": "claudeSessionMonitor.resumeAll",
           "when": "view == claudeSessionMonitor.view",
           "group": "navigation@0"
         },
         {
-          "command": "claudeSessionMonitor.toggleWorkspaceOnly",
+          "command": "claudeSessionMonitor.toggleNeedsYouOnly",
           "when": "view == claudeSessionMonitor.view",
           "group": "navigation@1"
         },
         {
-          "command": "claudeSessionMonitor.refresh",
+          "command": "claudeSessionMonitor.toggleWorkspaceOnly",
           "when": "view == claudeSessionMonitor.view",
           "group": "navigation@2"
         },
         {
+          "command": "claudeSessionMonitor.refresh",
+          "when": "view == claudeSessionMonitor.view",
+          "group": "navigation@3"
+        },
+        {
           "command": "claudeSessionMonitor.clearEnded",
+          "when": "view == claudeSessionMonitor.view",
+          "group": "navigation@4"
+        },
+        {
+          "command": "claudeSessionMonitor.stopResumeAll",
+          "when": "view == claudeSessionMonitor.view",
+          "group": "overflow"
+        },
+        {
+          "command": "claudeSessionMonitor.dumpTabs",
           "when": "view == claudeSessionMonitor.view",
           "group": "overflow"
         }
@@ -98,8 +132,13 @@
       "view/item/context": [
         {
           "command": "claudeSessionMonitor.openTranscript",
-          "when": "view == claudeSessionMonitor.view && viewItem == session",
-          "group": "inline"
+          "when": "view == claudeSessionMonitor.view && viewItem =~ /session/",
+          "group": "inline@1"
+        },
+        {
+          "command": "claudeSessionMonitor.removeSession",
+          "when": "view == claudeSessionMonitor.view && viewItem == session-ended",
+          "group": "inline@2"
         }
       ]
     },
@@ -161,6 +200,11 @@
           "type": "number",
           "default": 60,
           "description": "Sessions above this CPU% are flagged with a flame icon."
+        },
+        "claudeSessionMonitor.resumeStaggerSeconds": {
+          "type": "number",
+          "default": 60,
+          "description": "Seconds between sessions during a staggered resume sweep (avoids hitting the rate limit by resuming all at once)."
         }
       }
     }
