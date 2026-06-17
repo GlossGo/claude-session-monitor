@@ -25,6 +25,7 @@ import {
   readLimits,
   readLimitsHistory,
   pruneLimitsHistory,
+  parseResetToEpoch,
   MONITOR_DIR,
   PROJECTS_DIR,
   DEFAULT_ENTRYPOINTS,
@@ -185,12 +186,21 @@ interface Gauge {
   resetMs: number | null;
 }
 
+interface LimitedHit {
+  title: string;
+  sub: string;
+  resetText?: string;
+  resetMs: number | null;
+}
+
 interface LimitsPayload {
   type: "update";
   ts: number | null;
   model: string | null;
+  official: boolean; // true only when real 5h/7d gauges are available (terminal status line)
   gauges: Gauge[];
   history: { t: number; fh: number | null; sd: number | null }[];
+  limited: LimitedHit[]; // reactive: sessions that actually hit a limit (from transcripts)
 }
 
 function normPct(u: unknown): number | null {
@@ -207,7 +217,8 @@ function normResetMs(r: unknown): number | null {
   return null;
 }
 
-function buildLimitsPayload(): LimitsPayload {
+function buildLimitsPayload(views: SessionView[]): LimitsPayload {
+  const now = Date.now() / 1000;
   const lim = readLimits();
   const gauges: Gauge[] = [];
   if (lim) {
@@ -221,12 +232,19 @@ function buildLimitsPayload(): LimitsPayload {
         resetMs: normResetMs(lim.sds_reset),
       });
   }
+  const official = gauges.some((g) => g.pct != null);
   const history = readLimitsHistory(240).map((p) => ({
     t: typeof p.ts === "number" ? p.ts * 1000 : 0,
     fh: normPct(p.fh),
     sd: normPct(p.sd),
   }));
-  return { type: "update", ts: lim?.ts ?? null, model: lim?.model ?? null, gauges, history };
+  const limited: LimitedHit[] = views
+    .filter((v) => v.bucket === "limited")
+    .map((v) => {
+      const e = v.resetText ? parseResetToEpoch(v.resetText, now) : undefined;
+      return { title: v.title, sub: v.sub, resetText: v.resetText, resetMs: e ? e * 1000 : null };
+    });
+  return { type: "update", ts: lim?.ts ?? null, model: lim?.model ?? null, official, gauges, history, limited };
 }
 
 class LimitsView implements vscode.WebviewViewProvider {
@@ -273,6 +291,11 @@ function limitsHtml(): string {
   .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:4px; vertical-align:middle; }
   svg { width:100%; height:48px; display:block; }
   .foot { margin-top:8px; font-size:11px; opacity:.55; }
+  .sec { margin-top:10px; }
+  .sec h4 { margin:0 0 4px 0; font-size:11px; opacity:.7; font-weight:600; }
+  .hit { padding:4px 0; border-top:1px solid var(--vscode-editorWidget-border, rgba(127,127,127,.2)); }
+  .hitt { font-weight:600; }
+  .note { margin-top:10px; font-size:11px; opacity:.6; line-height:1.4; }
 </style>
 </head>
 <body>
@@ -313,24 +336,40 @@ function spark(history){
 }
 function render(){
   const root = document.getElementById('root');
-  if(!last || !last.gauges || !last.gauges.length || last.gauges.every(g=>g.pct==null)){
-    root.innerHTML = '<div class="empty">Waiting for usage-limit data… (reload the window once so the status line starts reporting)</div>';
-    return;
-  }
+  if(!last){ return; }
   let h='';
-  for(const g of last.gauges){
-    const p = g.pct;
-    const pctTxt = p==null ? '—' : Math.round(p)+'%';
-    const w = p==null ? 0 : Math.max(2, Math.min(100, p));
-    h += '<div class="gauge"><div class="grow"><span class="glabel">'+esc(g.label)+'</span>'
-       + '<span class="gpct">'+pctTxt+'</span></div>'
-       + '<div class="bar"><div class="fill" style="width:'+w+'%;background:'+color(p)+'"></div></div>'
-       + '<div class="greset">'+fmtLeft(g.resetMs)+'</div></div>';
+  // Official 5h / 7d gauges: only present when a terminal status line feeds limits.json.
+  if(last.official){
+    for(const g of last.gauges){
+      const p = g.pct;
+      const pctTxt = p==null ? '—' : Math.round(p)+'%';
+      const w = p==null ? 0 : Math.max(2, Math.min(100, p));
+      h += '<div class="gauge"><div class="grow"><span class="glabel">'+esc(g.label)+'</span>'
+         + '<span class="gpct">'+pctTxt+'</span></div>'
+         + '<div class="bar"><div class="fill" style="width:'+w+'%;background:'+color(p)+'"></div></div>'
+         + '<div class="greset">'+fmtLeft(g.resetMs)+'</div></div>';
+    }
+    h += spark(last.history);
+    if(last.model || last.ts){
+      const age = last.ts ? Math.round(Date.now()/1000 - last.ts) : null;
+      h += '<div class="foot">'+(last.model?esc(last.model)+' · ':'')+(age!=null? 'updated '+age+'s ago':'')+'</div>';
+    }
   }
-  h += spark(last.history);
-  if(last.model || last.ts){
-    const age = last.ts ? Math.round(Date.now()/1000 - last.ts) : null;
-    h += '<div class="foot">'+(last.model?esc(last.model)+' · ':'')+(age!=null? 'updated '+age+'s ago':'')+'</div>';
+  // Reactive limit hits: always real, derived from session transcripts (429).
+  if(last.limited && last.limited.length){
+    h += '<div class="sec"><h4>Active limit hits</h4>';
+    for(const l of last.limited){
+      const reset = l.resetMs ? (' · '+fmtLeft(l.resetMs)) : (l.resetText? (' · resets '+esc(l.resetText)) : '');
+      h += '<div class="hit"><span class="hitt">'+esc(l.title)+'</span> <span class="greset">'+esc(l.sub)+reset+'</span></div>';
+    }
+    h += '</div>';
+  }
+  // Honest note when the official live gauges are unavailable (VS Code app mode).
+  if(!last.official){
+    if(!last.limited || !last.limited.length){
+      h += '<div class="empty">No active limits right now.</div>';
+    }
+    h += '<div class="note">Live 5h / 7-day usage % is not exposed to extensions in the VS Code Claude app (only the terminal status line reports it). Sessions show up here the instant they hit a limit, with the reset countdown.</div>';
   }
   root.innerHTML = h;
 }
@@ -428,7 +467,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     updateStatusBar(statusBar, views, resourceCache);
     updateAux(treeView, views, resourceCache, needsYouOnly);
     try {
-      limitsView.update(buildLimitsPayload());
+      limitsView.update(buildLimitsPayload(views));
     } catch {
       /* ignore */
     }
@@ -752,27 +791,59 @@ function labelsMatch(tabLabel: string, title: string): boolean {
   return a === b || a.startsWith(b) || b.startsWith(a);
 }
 
+function writeTabDebug(dbg: unknown): void {
+  try {
+    fs.writeFileSync(MONITOR_DIR + "/tabs-debug.json", JSON.stringify(dbg, null, 2));
+  } catch {
+    /* ignore */
+  }
+}
+
 async function jumpToSession(v: SessionView): Promise<void> {
+  const dbg: any = { ts: new Date().toISOString(), title: v.title, groups: [], matched: null, action: null, error: null };
   try {
     const groups = vscode.window.tabGroups.all;
+    groups.forEach((g, gi) => {
+      dbg.groups.push({
+        groupIndex: gi,
+        active: g.isActive,
+        tabs: g.tabs.map((t, ti) => ({
+          i: ti,
+          label: t.label,
+          active: t.isActive,
+          kind: (t.input && (t.input as any).constructor && (t.input as any).constructor.name) || typeof t.input,
+        })),
+      });
+    });
+
     for (let gi = 0; gi < groups.length; gi++) {
       const tabs = groups[gi].tabs;
       const ti = tabs.findIndex((t) => t.label && labelsMatch(t.label, v.title));
       if (ti >= 0) {
+        dbg.matched = { groupIndex: gi, tabIndex: ti, label: tabs[ti].label };
         if (gi < FOCUS_GROUP_CMDS.length) {
           await vscode.commands.executeCommand(FOCUS_GROUP_CMDS[gi]);
         }
         if (ti < 9) {
           await vscode.commands.executeCommand(`workbench.action.openEditorAtIndex${ti + 1}`);
+          dbg.action = "openEditorAtIndex" + (ti + 1);
         } else {
-          await vscode.commands.executeCommand("workbench.action.lastEditorInGroup");
+          // beyond index 9 there is no direct command: jump to the first tab and step.
+          await vscode.commands.executeCommand("workbench.action.openEditorAtIndex1");
+          for (let k = 0; k < ti; k++) {
+            await vscode.commands.executeCommand("workbench.action.nextEditorInGroup");
+          }
+          dbg.action = "step-to-" + ti;
         }
+        writeTabDebug(dbg);
         return;
       }
     }
-  } catch {
-    /* fall through to transcript */
+    dbg.action = "no-match -> transcript";
+  } catch (e) {
+    dbg.error = String(e);
   }
+  writeTabDebug(dbg);
   openTranscript(v);
 }
 
