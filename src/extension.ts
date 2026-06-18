@@ -16,7 +16,6 @@
 import * as vscode from "vscode";
 import * as fs from "fs";
 import * as os from "os";
-import * as https from "https";
 import { execFile, execFileSync } from "child_process";
 import {
   collectSessions,
@@ -37,6 +36,15 @@ import {
   type TxInfo,
   type TokenUsage,
 } from "./core";
+
+/** Append a line to ~/.claude/session-monitor/csm-debug.log (best-effort, for diagnosis). */
+function log(msg: string): void {
+  try {
+    fs.appendFileSync(`${MONITOR_DIR}/csm-debug.log`, `${new Date().toISOString()} ${msg}\n`);
+  } catch {
+    /* ignore */
+  }
+}
 
 type GroupKey = "limited" | "waiting" | "done" | "working" | "ended" | "unknown";
 
@@ -136,31 +144,38 @@ class SessionTree implements vscode.TreeDataProvider<Node> {
       return item;
     }
     const v = node.view;
-    const item = new vscode.TreeItem(v.title, vscode.TreeItemCollapsibleState.None);
+    try {
+      const item = new vscode.TreeItem(v.title, vscode.TreeItemCollapsibleState.None);
 
-    const res = this.resOf(v);
-    const segs = [v.sub];
-    if (v.detail) segs.push(v.detail);
-    if (res) {
-      const hog = res.cpu >= this.hogThreshold();
-      segs.push(`${hog ? "🔥" : ""}CPU ${Math.round(res.cpu)}% · ${res.rssMb}MB`);
+      const res = this.resOf(v);
+      const segs = [v.sub];
+      if (v.detail) segs.push(v.detail);
+      if (res) {
+        const hog = res.cpu >= this.hogThreshold();
+        segs.push(`${hog ? "🔥" : ""}CPU ${Math.round(res.cpu)}% · ${res.rssMb}MB`);
+      }
+      item.description = segs.join(" · ");
+
+      const resTip = res ? `\nCPU: ${Math.round(res.cpu)}%  RAM: ${res.rssMb}MB  (pid ${v.pid})` : "";
+      item.tooltip = v.tooltip + resTip;
+      item.contextValue = groupOf(v) === "ended" ? "session-ended" : "session";
+      const g = GROUPS[GROUP_INDEX[groupOf(v)]];
+      item.iconPath = new vscode.ThemeIcon(
+        groupOf(v) === "working" && v.stale ? "warning" : g.icon,
+        new vscode.ThemeColor(g.color),
+      );
+      item.command = {
+        command: "claudeSessionMonitor.openSession",
+        title: "Open",
+        arguments: [v],
+      };
+      return item;
+    } catch (e) {
+      log("getTreeItem error: " + String(e));
+      const fb = new vscode.TreeItem(v.title || v.sessionId, vscode.TreeItemCollapsibleState.None);
+      fb.contextValue = "session";
+      return fb;
     }
-    item.description = segs.join(" · ");
-
-    const resTip = res ? `\nCPU: ${Math.round(res.cpu)}%  RAM: ${res.rssMb}MB  (pid ${v.pid})` : "";
-    item.tooltip = v.tooltip + resTip;
-    item.contextValue = groupOf(v) === "ended" ? "session-ended" : "session";
-    const g = GROUPS[GROUP_INDEX[groupOf(v)]];
-    item.iconPath = new vscode.ThemeIcon(
-      groupOf(v) === "working" && v.stale ? "warning" : g.icon,
-      new vscode.ThemeColor(g.color),
-    );
-    item.command = {
-      command: "claudeSessionMonitor.openSession",
-      title: "Open",
-      arguments: [v],
-    };
-    return item;
   }
 
   getChildren(node?: Node): Node[] {
@@ -256,7 +271,7 @@ function readClaudeToken(): string | undefined {
   }
 }
 
-function fetchOfficialUsage(cb: (u: OfficialUsage | null) => void): void {
+async function fetchOfficialUsage(): Promise<OfficialUsage | null> {
   let token: string | undefined;
   try {
     token = readClaudeToken();
@@ -264,53 +279,35 @@ function fetchOfficialUsage(cb: (u: OfficialUsage | null) => void): void {
     token = undefined;
   }
   if (!token) {
-    cb(null);
-    return;
+    log("usage: no keychain token");
+    return null;
   }
-  const req = https.request(
-    {
-      hostname: "api.anthropic.com",
-      path: "/api/oauth/usage",
-      method: "GET",
+  try {
+    const res = await fetch("https://api.anthropic.com/api/oauth/usage", {
       headers: {
         "Content-Type": "application/json",
         Authorization: `Bearer ${token}`,
         "anthropic-beta": "oauth-2025-04-20",
       },
-      timeout: 8000,
-    },
-    (res) => {
-      let body = "";
-      res.on("data", (c) => {
-        if (body.length < 200000) body += c;
-      });
-      res.on("end", () => {
-        try {
-          if (res.statusCode !== 200) {
-            cb(null);
-            return;
-          }
-          const p: any = JSON.parse(body);
-          const mk = (o: any): OfficialLimit | undefined =>
-            o && o.utilization != null ? { pct: normPct(o.utilization) ?? 0, resetMs: normResetMs(o.resets_at) } : undefined;
-          cb({
-            fiveHour: mk(p.five_hour),
-            sevenDay: mk(p.seven_day),
-            sevenDaySonnet: mk(p.seven_day_sonnet),
-            ts: Date.now() / 1000,
-          });
-        } catch {
-          cb(null);
-        }
-      });
-    },
-  );
-  req.on("error", () => cb(null));
-  req.on("timeout", () => {
-    req.destroy();
-    cb(null);
-  });
-  req.end();
+      signal: AbortSignal.timeout(8000),
+    });
+    if (!res.ok) {
+      log(`usage: HTTP ${res.status}`);
+      return null;
+    }
+    const p: any = await res.json();
+    const mk = (o: any): OfficialLimit | undefined =>
+      o && o.utilization != null ? { pct: normPct(o.utilization) ?? 0, resetMs: normResetMs(o.resets_at) } : undefined;
+    return {
+      fiveHour: mk(p.five_hour),
+      sevenDay: mk(p.seven_day),
+      sevenDaySonnet: mk(p.seven_day_sonnet),
+      ts: Date.now() / 1000,
+    };
+  } catch (e) {
+    log("usage: fetch error " + String(e));
+    return null;
+  }
 }
 
 function buildLimitsPayload(
@@ -550,6 +547,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
   let lastCleanup = 0;
   let lastResourceSample = 0;
   let lastTokenScan = 0;
+  let lastSessLog = 0;
   let tokenUsage: TokenUsage | null = null;
   let officialUsage: OfficialUsage | null = null;
   let lastUsageFetch = 0;
@@ -603,14 +601,19 @@ export function activate(ctx: vscode.ExtensionContext): void {
 
     if (now - lastUsageFetch > 90) {
       lastUsageFetch = now;
-      fetchOfficialUsage((u) => {
-        if (u) officialUsage = u;
-        try {
-          limitsView.update(buildLimitsPayload(lastViews, tokenUsage, officialUsage));
-        } catch {
-          /* ignore */
-        }
-      });
+      fetchOfficialUsage()
+        .then((u) => {
+          if (u) {
+            officialUsage = u;
+            log(`usage ok: 5h=${Math.round(u.fiveHour?.pct ?? -1)} 7d=${Math.round(u.sevenDay?.pct ?? -1)}`);
+          }
+          try {
+            limitsView.update(buildLimitsPayload(lastViews, tokenUsage, officialUsage));
+          } catch {
+            /* ignore */
+          }
+        })
+        .catch((e) => log("usage rejected: " + String(e)));
     }
 
     const wsOnly =
@@ -635,6 +638,11 @@ export function activate(ctx: vscode.ExtensionContext): void {
     if (dismissed.size) views = views.filter((v) => !dismissed.has(v.sessionId));
     if (needsYouOnly) views = views.filter((v) => NEEDS_YOU.includes(groupOf(v)));
     lastViews = views;
+
+    if (now - lastSessLog > 20) {
+      lastSessLog = now;
+      log(`sessions=${views.length} ${JSON.stringify(countBuckets(views))} dismissed=${dismissed.size} needsYouOnly=${needsYouOnly}`);
+    }
 
     tree.setData(views);
     updateStatusBar(statusBar, views, resourceCache);

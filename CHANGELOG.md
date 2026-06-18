@@ -4,6 +4,17 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.0.1]
+
+### Fixed
+
+- Official usage gauges going stale ("updated Nh ago"): replaced the Node
+  `https.request` call (which intermittently timed out in the extension host and
+  threw an internal `reading 'req'` error on destroy) with the global `fetch` API and
+  an abort timeout. Usage now refreshes reliably every ~90s.
+- Hardened tree rendering with a per-item guard and added a debug log
+  (`~/.claude/session-monitor/csm-debug.log`) for diagnosis.
+
 ## [1.0.0]
 
 First public release.
