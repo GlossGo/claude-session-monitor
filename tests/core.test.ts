@@ -414,3 +414,215 @@ describe("hardening edge cases", () => {
     expect(midLine.fiveHour).toBe(2000); // l1 partial dropped, only l2
   });
 });
+
+describe("resolve / collectSessions branch coverage", () => {
+  const toMap = (hooks: HookStatus[]) => {
+    const m = new Map<string, HookStatus>();
+    for (const h of hooks) m.set(h.session_id, h);
+    return m;
+  };
+  const collect = (hooks: HookStatus[], opts: Partial<Parameters<typeof collectSessions>[0]> = {}) =>
+    collectSessions({ now: NOW, hookStatuses: toMap(hooks), extraTranscripts: [], maxAgeSec: 24 * 3600, hideEndedOlderThanSec: 24 * 3600, ...opts });
+  const backdated = (name: string, lines: unknown[], sec: number) => {
+    const p = writeTranscript(name, lines);
+    fs.utimesSync(p, sec, sec);
+    return p;
+  };
+
+  it("marks a long-silent working session as stalled", () => {
+    const p = backdated("st.jsonl", [
+      { type: "assistant", entrypoint: "claude-vscode", message: { content: [{ type: "tool_use" }], stop_reason: "tool_use" }, timestamp: iso(NOW - 300) },
+    ], NOW - 300);
+    const v = collect([{ session_id: "st", state: "working", ts: NOW - 300, cwd: "/repo", transcript_path: p }]).find((x) => x.sessionId === "st");
+    expect(v?.bucket).toBe("working");
+    expect(v?.stale).toBe(true);
+    expect(v?.sub).toBe("working (stalled?)");
+  });
+
+  it("shows an ended session, and hides it once older than the cutoff", () => {
+    const fresh = writeTranscript("enf.jsonl", [
+      { type: "assistant", entrypoint: "claude-vscode", message: { content: [{ type: "text", text: "bye" }], stop_reason: "end_turn" }, timestamp: iso(NOW - 5) },
+    ]);
+    expect(collect([{ session_id: "enf", state: "ended", ts: NOW - 5, cwd: "/repo", transcript_path: fresh }]).find((x) => x.sessionId === "enf")?.bucket).toBe("ended");
+    const old = backdated("eno.jsonl", [
+      { type: "assistant", entrypoint: "claude-vscode", message: { content: [{ type: "text", text: "bye" }], stop_reason: "end_turn" }, timestamp: iso(NOW - 3600) },
+    ], NOW - 3600);
+    const hidden = collect([{ session_id: "eno", state: "ended", ts: NOW - 3600, cwd: "/repo", transcript_path: old }], { hideEndedOlderThanSec: 60 });
+    expect(hidden.find((x) => x.sessionId === "eno")).toBeUndefined();
+  });
+
+  it("derives working from assistant-without-stop-reason and from a trailing user prompt", () => {
+    const ao = writeTranscript("ao.jsonl", [
+      { type: "assistant", entrypoint: "claude-vscode", cwd: "/repo", message: { content: [{ type: "text", text: "thinking" }] }, timestamp: iso(NOW - 3) },
+    ]);
+    const ut = writeTranscript("ut.jsonl", [
+      { type: "assistant", entrypoint: "claude-vscode", cwd: "/repo", message: { content: [{ type: "text", text: "done" }], stop_reason: "end_turn" }, timestamp: iso(NOW - 10) },
+      { type: "user", entrypoint: "claude-vscode", cwd: "/repo", message: { content: [{ type: "text", text: "next" }] }, timestamp: iso(NOW - 2) },
+    ]);
+    const views = collect([
+      { session_id: "ao", state: "unknownstate", ts: 0, cwd: "/repo", transcript_path: ao },
+      { session_id: "ut", state: "unknownstate", ts: 0, cwd: "/repo", transcript_path: ut },
+    ]);
+    expect(views.find((x) => x.sessionId === "ao")?.bucket).toBe("working");
+    expect(views.find((x) => x.sessionId === "ut")?.bucket).toBe("working");
+  });
+
+  it("applies workspaceCwd and allowedEntrypoints=[] (allow all)", () => {
+    const repo = writeTranscript("wc1.jsonl", [{ type: "user", entrypoint: "claude-vscode", cwd: "/repo", message: { content: [{ type: "text", text: "q" }] }, timestamp: iso(NOW - 3) }]);
+    const other = writeTranscript("wc2.jsonl", [{ type: "user", entrypoint: "claude-vscode", cwd: "/other", message: { content: [{ type: "text", text: "q" }] }, timestamp: iso(NOW - 3) }]);
+    const sdk = writeTranscript("wc3.jsonl", [{ type: "user", entrypoint: "sdk-py", cwd: "/repo", message: { content: [{ type: "text", text: "q" }] }, timestamp: iso(NOW - 3) }]);
+    const ws = collect(
+      [
+        { session_id: "wc1", state: "working", ts: NOW - 3, cwd: "/repo", transcript_path: repo },
+        { session_id: "wc2", state: "working", ts: NOW - 3, cwd: "/other", transcript_path: other },
+      ],
+      { workspaceCwd: "/repo" },
+    );
+    expect(ws.find((x) => x.sessionId === "wc1")).toBeDefined();
+    expect(ws.find((x) => x.sessionId === "wc2")).toBeUndefined();
+    const all = collect([{ session_id: "wc3", state: "working", ts: NOW - 3, cwd: "/repo", transcript_path: sdk }], { allowedEntrypoints: [] });
+    expect(all.find((x) => x.sessionId === "wc3")).toBeDefined();
+  });
+
+  it("excludes a session with no recent activity (maxAge)", () => {
+    const old = backdated("max.jsonl", [
+      { type: "assistant", entrypoint: "claude-vscode", message: { content: [{ type: "text", text: "done" }], stop_reason: "end_turn" }, timestamp: iso(NOW - 7200) },
+    ], NOW - 7200);
+    expect(collect([{ session_id: "mx", state: "idle", ts: NOW - 7200, cwd: "/repo", transcript_path: old }], { maxAgeSec: 3600 }).find((x) => x.sessionId === "mx")).toBeUndefined();
+  });
+});
+
+describe("classifyConvLine / extractText / parseResetToEpoch extras", () => {
+  it("reads api-error text from a string content body", () => {
+    const p = writeTranscript("strc.jsonl", [
+      { type: "assistant", entrypoint: "claude-vscode", isApiErrorMessage: true, apiErrorStatus: 429, message: { content: "You've hit your session limit · resets 9:05am (Europe/Istanbul)" }, timestamp: iso(NOW - 5) },
+    ]);
+    const tx = parseTranscriptTail(p);
+    expect(tx.limit?.kind).toBe("session");
+    expect(tx.limit?.resetText).toBe("9:05am");
+  });
+  it("distinguishes 12pm (noon) from 12am (midnight)", () => {
+    const noon = parseResetToEpoch("12:00pm", NOW);
+    const mid = parseResetToEpoch("12:00am", NOW);
+    expect(noon).toBeDefined();
+    expect(mid).toBeDefined();
+    expect(noon).not.toBe(mid);
+  });
+});
+
+describe("scanTokenUsage edges", () => {
+  const usage = (sec: number, inp: number) =>
+    JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "x" }], usage: { input_tokens: inp, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } }, timestamp: iso(sec) });
+
+  it("waits for a complete final line (no trailing newline) then counts it", () => {
+    const p = path.join(tmp, "nonl.jsonl");
+    fs.writeFileSync(p, usage(NOW - 600, 700)); // no trailing newline
+    const off = path.join(tmp, "o.json");
+    const buck = path.join(tmp, "b.json");
+    expect(scanTokenUsage([{ path: p }], NOW, { offsetsFile: off, bucketsFile: buck }).fiveHour).toBe(0);
+    fs.appendFileSync(p, "\n");
+    expect(scanTokenUsage([{ path: p }], NOW, { offsetsFile: off, bucketsFile: buck }).fiveHour).toBe(700);
+  });
+
+  it("re-backfills after the file is truncated/rotated", () => {
+    const p = path.join(tmp, "rot.jsonl");
+    fs.writeFileSync(p, usage(NOW - 600, 1000) + "\n" + usage(NOW - 500, 2000) + "\n");
+    const off = path.join(tmp, "or.json");
+    const buck = path.join(tmp, "br.json");
+    expect(scanTokenUsage([{ path: p }], NOW, { offsetsFile: off, bucketsFile: buck }).fiveHour).toBe(3000);
+    fs.writeFileSync(p, usage(NOW - 100, 500) + "\n"); // truncate/rotate
+    expect(scanTokenUsage([{ path: p }], NOW, { offsetsFile: off, bucketsFile: buck }).fiveHour).toBe(3500);
+  });
+});
+
+describe("more branch coverage", () => {
+  it("classifyLimit: session limit with no reset clock has undefined resetText", () => {
+    const r = classifyLimit("You've hit your session limit", 429);
+    expect(r?.kind).toBe("session");
+    expect(r?.resetText).toBeUndefined();
+  });
+
+  it("parseTranscriptTail: a 429 with non-limit text is api_error with no limit", () => {
+    const p = writeTranscript("n429.jsonl", [
+      { type: "assistant", isApiErrorMessage: true, apiErrorStatus: 429, message: { content: [{ type: "text", text: "429 too many requests, retry" }] }, timestamp: iso(NOW - 5) },
+    ]);
+    const tx = parseTranscriptTail(p);
+    expect(tx.convKind).toBe("api_error");
+    expect(tx.limit).toBeUndefined();
+  });
+
+  it("parseTranscriptTail: tool_use detected via a content block without stop_reason", () => {
+    const p = writeTranscript("tub.jsonl", [
+      { type: "assistant", entrypoint: "claude-vscode", message: { content: [{ type: "tool_use", name: "Read" }] }, timestamp: iso(NOW - 3) },
+    ]);
+    expect(parseTranscriptTail(p).convKind).toBe("tool_use");
+  });
+
+  it("rate-limit sub, no-cwd, permission_mode/message tooltip, unknown entrypoint, dedup", () => {
+    const rate = writeTranscript("rate.jsonl", [
+      { type: "user", entrypoint: "claude-vscode", cwd: "/repo", message: { content: [{ type: "text", text: "q" }] }, timestamp: iso(NOW - 30) },
+      { type: "assistant", isApiErrorMessage: true, apiErrorStatus: 429, message: { content: [{ type: "text", text: "API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited" }] }, timestamp: iso(NOW - 10) },
+    ]);
+    const noCwd = writeTranscript("nocwd.jsonl", [
+      { type: "assistant", message: { content: [{ type: "text", text: "done" }], stop_reason: "end_turn" }, timestamp: iso(NOW - 3) },
+    ]);
+    const st = fs.statSync(rate);
+    const hooks = new Map<string, HookStatus>();
+    hooks.set("rate", { session_id: "rate", state: "working", ts: NOW - 31, cwd: "/repo", transcript_path: rate });
+    hooks.set("nc", { session_id: "nc", state: "waiting", ts: NOW - 1, transcript_path: noCwd, permission_mode: "bypassPermissions", message: "needs permission to use Bash" });
+    const views = collectSessions({
+      now: NOW,
+      hookStatuses: hooks,
+      extraTranscripts: [{ sessionId: "rate", path: rate, mtimeMs: st.mtimeMs }],
+      maxAgeSec: 24 * 3600,
+      hideEndedOlderThanSec: 24 * 3600,
+    });
+    const rl = views.find((v) => v.sessionId === "rate");
+    expect(rl?.bucket).toBe("limited");
+    expect(rl?.sub).toBe("rate limited");
+    const nc = views.find((v) => v.sessionId === "nc");
+    expect(nc?.bucket).toBe("attention");
+    expect(nc?.sub).toBe("waiting for you");
+    expect(nc?.cwdLabel).toBeUndefined();
+    expect(nc?.tooltip).toContain("mode: bypassPermissions");
+    expect(nc?.tooltip).toContain("notification: needs permission");
+  });
+
+  it("readLimits rejects an array; tokensOfLine handles missing fields; scan skips invalid ts", () => {
+    const f = path.join(tmp, "arr.json");
+    fs.writeFileSync(f, JSON.stringify([1, 2, 3]));
+    expect(readLimits(f)).toBeUndefined();
+    const p = writeTranscript("part.jsonl", [
+      { type: "assistant", message: { content: [{ type: "text", text: "x" }], usage: { input_tokens: 800 } }, timestamp: iso(NOW - 600) },
+      { type: "assistant", message: { content: [{ type: "text", text: "y" }], usage: { input_tokens: 100 } }, timestamp: "not-a-date" },
+    ]);
+    const u = scanTokenUsage([{ path: p }], NOW, { offsetsFile: path.join(tmp, "po.json"), bucketsFile: path.join(tmp, "pb.json") });
+    expect(u.fiveHour).toBe(800);
+  });
+});
+
+describe("defensive branch coverage", () => {
+  it("handles an empty transcript and an assistant line with no message", () => {
+    const empty = path.join(tmp, "empty.jsonl");
+    fs.writeFileSync(empty, "");
+    expect(parseTranscriptTail(empty).convKind).toBe("none");
+    const noMsg = writeTranscript("nomsg.jsonl", [{ type: "assistant", timestamp: iso(NOW - 3) }]);
+    expect(parseTranscriptTail(noMsg).convKind).toBe("assistant_other");
+  });
+
+  it("respects the per-call byte budget across files (deferring later files)", () => {
+    const usage = (sec: number, inp: number) =>
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: "x" }], usage: { input_tokens: inp, output_tokens: 0, cache_creation_input_tokens: 0, cache_read_input_tokens: 0 } }, timestamp: iso(sec) });
+    const f1 = path.join(tmp, "f1.jsonl");
+    const f2 = path.join(tmp, "f2.jsonl");
+    fs.writeFileSync(f1, usage(NOW - 600, 1000) + "\n");
+    fs.writeFileSync(f2, usage(NOW - 500, 2000) + "\n");
+    const off = path.join(tmp, "bo.json");
+    const buck = path.join(tmp, "bb.json");
+    const size1 = fs.statSync(f1).size;
+    const u1 = scanTokenUsage([{ path: f1 }, { path: f2 }], NOW, { offsetsFile: off, bucketsFile: buck, maxBytesPerCall: size1 });
+    expect(u1.fiveHour).toBe(1000); // f2 deferred this call
+    const u2 = scanTokenUsage([{ path: f1 }, { path: f2 }], NOW, { offsetsFile: off, bucketsFile: buck, maxBytesPerCall: size1 });
+    expect(u2.fiveHour).toBe(3000); // f2 picked up next call
+  });
+});

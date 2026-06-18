@@ -4,6 +4,19 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.3.0]
+
+### Added
+
+- Raised core + view branch coverage to ~86% (60 tests total) with targeted edge
+  cases (stalled/ended/maxAge resolution, rate vs session limit, no-cwd tooltips,
+  unknown-entrypoint, candidate dedup, token-scanner truncation / no-trailing-newline
+  / per-call budget / boundary backfill, corrupt-state tolerance).
+- A `vscode`-mocked integration test for `extension.ts`: `activate()` wires the tree,
+  webview, status bar and all 11 commands, and refresh / openSession / deactivate run
+  without throwing (isolated to a temp home, no real keychain / ps / network).
+- Extracted `parsePsOutput` into `src/view.ts` with its own test.
+
 ## [1.2.0]
 
 ### Added
