@@ -2,7 +2,7 @@
   "name": "claude-session-monitor",
   "displayName": "Claude Session Monitor",
   "description": "Live monitor for all your Claude Code sessions: which is working, which is waiting for you, which hit a limit, plus per-session CPU/RAM and 5h/7d usage limits.",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "publisher": "glossgo",
   "license": "MIT",
   "icon": "icon.png",
@@ -248,6 +248,7 @@
     "verify": "esbuild src/verify.ts --bundle --platform=node --format=cjs --outfile=dist/verify.cjs && node dist/verify.cjs",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "vscode:prepublish": "npm run build",
     "package": "vsce package --allow-missing-repository --no-dependencies"
@@ -258,6 +259,7 @@
     "@vscode/vsce": "^3.2.0",
     "esbuild": "^0.24.0",
     "typescript": "^5.4.0",
-    "vitest": "^2.1.8"
+    "vitest": "^2.1.8",
+    "@vitest/coverage-v8": "^2.1.8"
   }
 }

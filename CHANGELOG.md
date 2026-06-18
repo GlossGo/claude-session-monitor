@@ -4,6 +4,22 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.2.0]
+
+### Added
+
+- Expanded test suite to 41 tests (~92% statement / ~97% function coverage on the
+  core + view logic). Extracted the pure UI helpers into `src/view.ts`
+  (`groupOf`, `normPct`, `normResetMs`, `fmtMb`, `labelsMatch`, `parsePsOutput`) with
+  their own tests, and made the IO functions dependency-injectable for testing.
+
+### Fixed (from a second adversarial review)
+
+- `scanTokenUsage` no longer drops a complete first usage line when a backfill window
+  begins exactly on a line boundary.
+- A non-error line written in the same second as a 429 no longer clears the detected
+  limit, so the "Limited" state is preserved.
+
 ## [1.1.0]
 
 ### Added

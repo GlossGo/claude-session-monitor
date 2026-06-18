@@ -36,6 +36,19 @@ import {
   type TxInfo,
   type TokenUsage,
 } from "./core";
+import {
+  GROUPS,
+  GROUP_INDEX,
+  NEEDS_YOU,
+  groupOf,
+  normPct,
+  normResetMs,
+  fmtMb,
+  labelsMatch,
+  parsePsOutput,
+  type GroupKey,
+  type GroupMeta,
+} from "./view";
 
 /** Append a line to ~/.claude/session-monitor/csm-debug.log (best-effort, for diagnosis). */
 function log(msg: string): void {
@@ -46,43 +59,7 @@ function log(msg: string): void {
   }
 }
 
-type GroupKey = "limited" | "waiting" | "done" | "working" | "ended" | "unknown";
-
-interface GroupMeta {
-  key: GroupKey;
-  label: string;
-  icon: string;
-  color: string;
-}
-
-const GROUPS: GroupMeta[] = [
-  { key: "limited", label: "Limited", icon: "error", color: "charts.red" },
-  { key: "waiting", label: "Waiting for you", icon: "bell-dot", color: "charts.yellow" },
-  { key: "done", label: "Your turn", icon: "comment", color: "charts.blue" },
-  { key: "working", label: "Working", icon: "sync", color: "charts.green" },
-  { key: "ended", label: "Ended", icon: "circle-slash", color: "disabledForeground" },
-  { key: "unknown", label: "Unknown", icon: "question", color: "disabledForeground" },
-];
-
-const GROUP_INDEX: Record<GroupKey, number> = {
-  limited: 0,
-  waiting: 1,
-  done: 2,
-  working: 3,
-  ended: 4,
-  unknown: 5,
-};
-
-const NEEDS_YOU: GroupKey[] = ["limited", "waiting", "done"];
 const RES_FRESH_SEC = 12;
-
-function groupOf(v: SessionView): GroupKey {
-  if (v.bucket === "limited") return "limited";
-  if (v.bucket === "working") return "working";
-  if (v.bucket === "ended") return "ended";
-  if (v.bucket === "attention") return v.sub === "waiting for you" ? "waiting" : "done";
-  return "unknown";
-}
 
 interface ResStat {
   cpu: number;
@@ -221,20 +198,6 @@ interface LimitsPayload {
   history: { t: number; fh: number | null; sd: number | null }[];
   limited: LimitedHit[]; // reactive: sessions that actually hit a limit (from transcripts)
   tokens: TokenUsage | null; // rolling 5h / 7d token usage (proxy for limit pressure)
-}
-
-function normPct(u: unknown): number | null {
-  if (typeof u !== "number" || !Number.isFinite(u)) return null;
-  return u <= 1 ? u * 100 : u;
-}
-
-function normResetMs(r: unknown): number | null {
-  if (typeof r === "number" && Number.isFinite(r)) return r < 1e12 ? r * 1000 : r;
-  if (typeof r === "string") {
-    const ms = Date.parse(r);
-    return Number.isFinite(ms) ? ms : null;
-  }
-  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -884,18 +847,8 @@ function sampleResources(pids: number[], cache: Map<number, ResStat>, done: () =
   execFile("ps", ["-o", "pid=,pcpu=,rss=", "-p", list], { timeout: 4000 }, (err, stdout) => {
     const now = Date.now() / 1000;
     if (!err && stdout) {
-      for (const line of stdout.split("\n")) {
-        const p = line.trim().split(/\s+/);
-        if (p.length < 3) continue;
-        const pid = parseInt(p[0], 10);
-        const cpu = parseFloat(p[1]);
-        const rssKb = parseInt(p[2], 10);
-        if (!Number.isFinite(pid)) continue;
-        cache.set(pid, {
-          cpu: Number.isFinite(cpu) ? cpu : 0,
-          rssMb: Math.round((Number.isFinite(rssKb) ? rssKb : 0) / 1024),
-          ts: now,
-        });
+      for (const r of parsePsOutput(String(stdout))) {
+        cache.set(r.pid, { cpu: r.cpu, rssMb: r.rssMb, ts: now });
       }
     }
     for (const [pid, v] of cache) if (now - v.ts > 60) cache.delete(pid);
@@ -985,10 +938,6 @@ function updateAux(
   treeView.message = totalRss
     ? `${filt}total load: CPU ${Math.round(totalCpu)}% · ${fmtMb(totalRss)}`
     : filt || undefined;
-}
-
-function fmtMb(mb: number): string {
-  return mb >= 1024 ? `${(mb / 1024).toFixed(1)}GB` : `${mb}MB`;
 }
 
 // ---------------------------------------------------------------------------
@@ -1097,17 +1046,6 @@ const FOCUS_GROUP_CMDS = [
   "workbench.action.focusSeventhEditorGroup",
   "workbench.action.focusEighthEditorGroup",
 ];
-
-function normLabel(s: string): string {
-  return s.replace(/[….]+$/, "").trim().toLowerCase();
-}
-
-function labelsMatch(tabLabel: string, title: string): boolean {
-  const a = normLabel(tabLabel);
-  const b = normLabel(title);
-  if (!a || !b) return false;
-  return a === b || a.startsWith(b) || b.startsWith(a);
-}
 
 function writeTabDebug(dbg: unknown): void {
   try {

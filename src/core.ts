@@ -110,18 +110,18 @@ export const BUCKET_ORDER: Record<Bucket, number> = {
 // Hook status files
 // ---------------------------------------------------------------------------
 
-export function readHookStatuses(): Map<string, HookStatus> {
+export function readHookStatuses(dir = MONITOR_DIR): Map<string, HookStatus> {
   const map = new Map<string, HookStatus>();
   let files: string[];
   try {
-    files = fs.readdirSync(MONITOR_DIR);
+    files = fs.readdirSync(dir);
   } catch {
     return map;
   }
   for (const f of files) {
     if (!f.endsWith(".json")) continue;
     try {
-      const raw = fs.readFileSync(path.join(MONITOR_DIR, f), "utf8");
+      const raw = fs.readFileSync(path.join(dir, f), "utf8");
       const obj = JSON.parse(raw) as HookStatus;
       if (obj && obj.session_id) map.set(obj.session_id, obj);
     } catch {
@@ -263,7 +263,9 @@ function parseWindow(file: string, stat: fs.Stats, maxBytes: number): TxInfo {
     if (ts > info.activityTs) info.activityTs = ts;
 
     if (type === "user" || type === "assistant") {
-      if (ts >= info.convTs) {
+      // Last writer wins, EXCEPT a same-second tie must not clear an api_error limit
+      // (e.g. a user line written in the same second as a 429 would hide the limit).
+      if (ts > info.convTs || (ts === info.convTs && info.convKind !== "api_error")) {
         info.convTs = ts;
         const c = classifyConvLine(obj);
         info.convKind = c.kind;
@@ -501,11 +503,12 @@ export function findRecentTranscripts(
   limit: number,
   now: number,
   onlyCwd?: string,
+  projectsRoot = PROJECTS_DIR,
 ): RecentTranscript[] {
   const out: RecentTranscript[] = [];
   let dirs: fs.Dirent[];
   try {
-    dirs = fs.readdirSync(PROJECTS_DIR, { withFileTypes: true });
+    dirs = fs.readdirSync(projectsRoot, { withFileTypes: true });
   } catch {
     return out;
   }
@@ -515,7 +518,7 @@ export function findRecentTranscripts(
     if (!d.isDirectory()) continue;
     if (dirExcluded(d.name)) continue;
     if (wantDir && d.name !== wantDir) continue;
-    const dirPath = path.join(PROJECTS_DIR, d.name);
+    const dirPath = path.join(projectsRoot, d.name);
     let files: string[];
     try {
       files = fs.readdirSync(dirPath);
@@ -628,17 +631,17 @@ export function countBuckets(views: SessionView[]): BucketCounts {
 }
 
 /** Delete monitor json files older than maxAgeMs (keeps the dir tidy). */
-export function cleanupMonitorFiles(maxAgeMs: number, now: number): number {
+export function cleanupMonitorFiles(maxAgeMs: number, now: number, dir = MONITOR_DIR): number {
   let removed = 0;
   let files: string[];
   try {
-    files = fs.readdirSync(MONITOR_DIR);
+    files = fs.readdirSync(dir);
   } catch {
     return 0;
   }
   for (const f of files) {
     if (!f.endsWith(".json")) continue;
-    const full = path.join(MONITOR_DIR, f);
+    const full = path.join(dir, f);
     try {
       const st = fs.statSync(full);
       if (now * 1000 - st.mtimeMs > maxAgeMs) {
@@ -657,17 +660,17 @@ export function cleanupMonitorFiles(maxAgeMs: number, now: number): number {
  * beyond `staleMs`. Live working/waiting sessions are kept (their only
  * "waiting"/Notification signal must survive a manual cleanup).
  */
-export function cleanupEndedMonitorFiles(now: number, staleMs = 12 * 3600 * 1000): number {
+export function cleanupEndedMonitorFiles(now: number, staleMs = 12 * 3600 * 1000, dir = MONITOR_DIR): number {
   let removed = 0;
   let files: string[];
   try {
-    files = fs.readdirSync(MONITOR_DIR);
+    files = fs.readdirSync(dir);
   } catch {
     return 0;
   }
   for (const f of files) {
     if (!f.endsWith(".json")) continue;
-    const full = path.join(MONITOR_DIR, f);
+    const full = path.join(dir, f);
     try {
       const st = fs.statSync(full);
       let ended = false;
@@ -803,6 +806,8 @@ export interface TokenScanOpts {
   maxBytesPerCall?: number;
   offsetsFile?: string;
   bucketsFile?: string;
+  backfillCap?: number; // overridable for tests
+  fileReadCap?: number; // overridable for tests
 }
 
 export function scanTokenUsage(
@@ -813,6 +818,8 @@ export function scanTokenUsage(
   const offsetsFile = opts.offsetsFile ?? TOKEN_OFFSETS;
   const bucketsFile = opts.bucketsFile ?? TOKEN_BUCKETS;
   const maxBytesPerCall = opts.maxBytesPerCall ?? SCAN_BYTE_BUDGET;
+  const backfillCap = opts.backfillCap ?? BACKFILL_CAP;
+  const fileReadCap = opts.fileReadCap ?? FILE_READ_CAP;
   const offsets = readJson<Record<string, { offset: number; size: number }>>(offsetsFile, {});
   const buckets = readJson<Record<string, number>>(bucketsFile, {});
   let bytesRead = 0;
@@ -826,16 +833,16 @@ export function scanTokenUsage(
       continue;
     }
     const prev = offsets[t.path];
-    let start = prev ? prev.offset : Math.max(0, st.size - BACKFILL_CAP);
-    if (prev && st.size < prev.size) start = Math.max(0, st.size - BACKFILL_CAP); // rotated/truncated
+    let start = prev ? prev.offset : Math.max(0, st.size - backfillCap);
+    if (prev && st.size < prev.size) start = Math.max(0, st.size - backfillCap); // rotated/truncated
     if (start >= st.size) {
       offsets[t.path] = { offset: st.size, size: st.size };
       continue;
     }
 
-    // Bounded read: never more than FILE_READ_CAP or the remaining budget, so a huge
+    // Bounded read: never more than fileReadCap or the remaining budget, so a huge
     // delta cannot exhaust memory, and the offset always advances (no infinite re-read).
-    const want = Math.min(st.size - start, FILE_READ_CAP, maxBytesPerCall - bytesRead);
+    const want = Math.min(st.size - start, fileReadCap, maxBytesPerCall - bytesRead);
     if (want <= 0) break;
     let chunk = "";
     let read = 0;
@@ -865,7 +872,25 @@ export function scanTokenUsage(
     // Advance by BYTES (not char index) so multi-byte UTF-8 does not drift the offset.
     const consumed = Buffer.byteLength(chunk.slice(0, lastNl + 1), "utf8");
     const lines = body.split("\n");
-    const startIdx = !prev && start > 0 ? 1 : 0; // drop partial first line on backfill
+    // Backfill starts mid-file -> drop the first (partial) line, UNLESS `start` is
+    // exactly on a line boundary (the preceding byte is a newline), in which case the
+    // first line is complete and must be kept.
+    let startIdx = 0;
+    if (!prev && start > 0) {
+      startIdx = 1;
+      try {
+        const fd2 = fs.openSync(t.path, "r");
+        try {
+          const b = Buffer.alloc(1);
+          fs.readSync(fd2, b, 0, 1, start - 1);
+          if (b[0] === 0x0a) startIdx = 0;
+        } finally {
+          fs.closeSync(fd2);
+        }
+      } catch {
+        /* keep startIdx = 1 */
+      }
+    }
 
     for (let i = startIdx; i < lines.length; i++) {
       const s = lines[i].trim();
