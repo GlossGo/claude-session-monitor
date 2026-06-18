@@ -709,7 +709,8 @@ export interface RawLimits {
 
 export function readLimits(file = LIMITS_FILE): RawLimits | undefined {
   try {
-    return JSON.parse(fs.readFileSync(file, "utf8")) as RawLimits;
+    const v = JSON.parse(fs.readFileSync(file, "utf8"));
+    return v && typeof v === "object" && !Array.isArray(v) ? (v as RawLimits) : undefined;
   } catch {
     return undefined;
   }
@@ -744,7 +745,7 @@ export function pruneLimitsHistory(maxLines = 3000): void {
   try {
     const lines = fs.readFileSync(LIMITS_HISTORY, "utf8").split("\n").filter((l) => l.trim());
     if (lines.length > maxLines) {
-      fs.writeFileSync(LIMITS_HISTORY, lines.slice(-maxLines).join("\n") + "\n");
+      atomicWrite(LIMITS_HISTORY, lines.slice(-maxLines).join("\n") + "\n");
     }
   } catch {
     // ignore
@@ -763,6 +764,7 @@ export function pruneLimitsHistory(maxLines = 3000): void {
 export const TOKEN_OFFSETS = path.join(MONITOR_DIR, "token-offsets.json");
 export const TOKEN_BUCKETS = path.join(MONITOR_DIR, "token-buckets.json");
 const BACKFILL_CAP = 4 * 1024 * 1024; // first-pass per-file tail cap
+const FILE_READ_CAP = 8 * 1024 * 1024; // max bytes read from a single file per scan call
 const SCAN_BYTE_BUDGET = 30 * 1024 * 1024; // max bytes read per scan call (backfill spreads over ticks)
 
 export interface TokenUsage {
@@ -781,10 +783,20 @@ function tokensOfLine(obj: any): number {
 
 function readJson<T>(file: string, fallback: T): T {
   try {
-    return JSON.parse(fs.readFileSync(file, "utf8")) as T;
+    const v = JSON.parse(fs.readFileSync(file, "utf8"));
+    // Guard against a literal "null"/array/primitive (e.g. a truncated write):
+    // returning those would make the caller's object access throw.
+    return v && typeof v === "object" && !Array.isArray(v) ? (v as T) : fallback;
   } catch {
     return fallback;
   }
+}
+
+/** Write atomically (temp + rename) so a mid-write kill cannot truncate the target. */
+function atomicWrite(file: string, content: string): void {
+  const tmp = `${file}.tmp`;
+  fs.writeFileSync(tmp, content);
+  fs.renameSync(tmp, file);
 }
 
 export interface TokenScanOpts {
@@ -806,6 +818,7 @@ export function scanTokenUsage(
   let bytesRead = 0;
 
   for (const t of transcripts) {
+    if (bytesRead >= maxBytesPerCall) break; // resume remaining files next call (offsets persist)
     let st: fs.Stats;
     try {
       st = fs.statSync(t.path);
@@ -819,31 +832,38 @@ export function scanTokenUsage(
       offsets[t.path] = { offset: st.size, size: st.size };
       continue;
     }
-    if (bytesRead > maxBytesPerCall) break; // resume remaining files next call (offsets persist)
-    bytesRead += st.size - start;
 
+    // Bounded read: never more than FILE_READ_CAP or the remaining budget, so a huge
+    // delta cannot exhaust memory, and the offset always advances (no infinite re-read).
+    const want = Math.min(st.size - start, FILE_READ_CAP, maxBytesPerCall - bytesRead);
+    if (want <= 0) break;
     let chunk = "";
+    let read = 0;
     try {
       const fd = fs.openSync(t.path, "r");
       try {
-        const len = st.size - start;
-        const buf = Buffer.alloc(len);
-        fs.readSync(fd, buf, 0, len, start);
-        chunk = buf.toString("utf8");
+        const buf = Buffer.alloc(want);
+        read = fs.readSync(fd, buf, 0, want, start);
+        chunk = buf.toString("utf8", 0, read);
       } finally {
         fs.closeSync(fd);
       }
     } catch {
       continue;
     }
+    bytesRead += read;
+    const atEof = start + read >= st.size;
 
     const lastNl = chunk.lastIndexOf("\n");
     if (lastNl < 0) {
-      offsets[t.path] = { offset: start, size: st.size }; // wait for a complete line
+      // No complete line in this chunk.
+      if (atEof) offsets[t.path] = { offset: start, size: st.size }; // last line still being written
+      else offsets[t.path] = { offset: start + read, size: st.size }; // skip past an over-long line
       continue;
     }
     const body = chunk.slice(0, lastNl);
-    const consumed = lastNl + 1;
+    // Advance by BYTES (not char index) so multi-byte UTF-8 does not drift the offset.
+    const consumed = Buffer.byteLength(chunk.slice(0, lastNl + 1), "utf8");
     const lines = body.split("\n");
     const startIdx = !prev && start > 0 ? 1 : 0; // drop partial first line on backfill
 
@@ -871,12 +891,12 @@ export function scanTokenUsage(
   for (const k of Object.keys(buckets)) if (parseInt(k, 10) < cutoffHour) delete buckets[k];
 
   try {
-    fs.writeFileSync(offsetsFile, JSON.stringify(offsets));
+    atomicWrite(offsetsFile, JSON.stringify(offsets));
   } catch {
     /* ignore */
   }
   try {
-    fs.writeFileSync(bucketsFile, JSON.stringify(buckets));
+    atomicWrite(bucketsFile, JSON.stringify(buckets));
   } catch {
     /* ignore */
   }

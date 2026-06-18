@@ -4,6 +4,27 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and this project adheres to
 [Semantic Versioning](https://semver.org/).
 
+## [1.1.0]
+
+### Added
+
+- A vitest unit-test suite (22 tests) for the core data layer, and a CI step that
+  runs typecheck + tests on every push.
+
+### Fixed (from an adversarial review)
+
+- **Token scanner**: bounded per-file reads (no out-of-memory on a large delta), the
+  offset now always advances (no infinite re-read loop), and offsets advance by
+  byte length so multi-byte UTF-8 no longer drifts/double-counts.
+- **Resume sweep**: self-chained with `setTimeout` so a slow step can no longer
+  overlap and type into the wrong tab; it re-verifies the active tab and that VS Code
+  is frontmost immediately before typing.
+- **Keychain read** is now async (`execFile`), so it no longer blocks the extension
+  host for up to 5s every 90s.
+- **Atomic writes** (temp + rename) for the token offsets/buckets and limits history,
+  and `readJson` now rejects a truncated `null`/array so a partial write can't crash
+  or double-count the scan.
+
 ## [1.0.1]
 
 ### Fixed

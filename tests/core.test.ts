@@ -289,6 +289,32 @@ describe("scanTokenUsage", () => {
     const u2 = scanTokenUsage([{ path: p }], NOW, { offsetsFile, bucketsFile });
     expect(u2.fiveHour).toBe(1500); // 1000 + 500, old line not recounted
   });
+
+  it("tolerates corrupt/empty state files without throwing", () => {
+    const p = writeTranscript("t3.jsonl", [usageLine(NOW - 1800, 1000, 0)]);
+    const offsetsFile = path.join(tmp, "off3.json");
+    const bucketsFile = path.join(tmp, "buck3.json");
+    fs.writeFileSync(offsetsFile, "null"); // literal null
+    fs.writeFileSync(bucketsFile, "not json {{{");
+    const u = scanTokenUsage([{ path: p }], NOW, { offsetsFile, bucketsFile });
+    expect(u.fiveHour).toBe(1000);
+  });
+
+  it("keeps a byte-accurate offset across multi-byte UTF-8 content", () => {
+    const turkish = "çalışıyor ğüşıöç ".repeat(5);
+    const p = writeTranscript("t4.jsonl", [
+      { type: "assistant", message: { content: [{ type: "text", text: turkish }], usage: { input_tokens: 1000, output_tokens: 0 } }, timestamp: iso(NOW - 1800) },
+    ]);
+    const offsetsFile = path.join(tmp, "off4.json");
+    const bucketsFile = path.join(tmp, "buck4.json");
+    expect(scanTokenUsage([{ path: p }], NOW, { offsetsFile, bucketsFile }).fiveHour).toBe(1000);
+    fs.appendFileSync(
+      p,
+      JSON.stringify({ type: "assistant", message: { content: [{ type: "text", text: turkish }], usage: { input_tokens: 500, output_tokens: 0 } }, timestamp: iso(NOW - 600) }) + "\n",
+    );
+    // Correct byte offset -> only the new 500 is added (a char-based offset would drift and mis-count).
+    expect(scanTokenUsage([{ path: p }], NOW, { offsetsFile, bucketsFile }).fiveHour).toBe(1500);
+  });
 });
 
 // --- readLimits / readLimitsHistory -----------------------------------------

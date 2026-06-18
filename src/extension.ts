@@ -16,7 +16,7 @@
 import * as vscode from "vscode";
 import * as fs from "fs";
 import * as os from "os";
-import { execFile, execFileSync } from "child_process";
+import { execFile } from "child_process";
 import {
   collectSessions,
   countBuckets,
@@ -255,29 +255,32 @@ interface OfficialUsage {
   ts: number;
 }
 
-function readClaudeToken(): string | undefined {
-  if (process.platform !== "darwin") return undefined;
-  try {
+function readClaudeToken(): Promise<string | undefined> {
+  if (process.platform !== "darwin") return Promise.resolve(undefined);
+  return new Promise((resolve) => {
     const user = process.env.USER || os.userInfo().username || "";
-    const raw = execFileSync(
+    execFile(
       "security",
       ["find-generic-password", "-a", user, "-w", "-s", "Claude Code-credentials"],
-      { encoding: "utf-8", timeout: 5000 },
-    ).trim();
-    const creds = JSON.parse(raw);
-    return creds?.claudeAiOauth?.accessToken;
-  } catch {
-    return undefined;
-  }
+      { encoding: "utf8", timeout: 5000 },
+      (err, stdout) => {
+        if (err) {
+          resolve(undefined);
+          return;
+        }
+        try {
+          const creds = JSON.parse(String(stdout).trim());
+          resolve(creds?.claudeAiOauth?.accessToken);
+        } catch {
+          resolve(undefined);
+        }
+      },
+    );
+  });
 }
 
 async function fetchOfficialUsage(): Promise<OfficialUsage | null> {
-  let token: string | undefined;
-  try {
-    token = readClaudeToken();
-  } catch {
-    token = undefined;
-  }
+  const token = await readClaudeToken();
   if (!token) {
     log("usage: no keychain token");
     return null;
@@ -555,11 +558,13 @@ export function activate(ctx: vscode.ExtensionContext): void {
   let needsYouOnly = false;
   let workspaceOnlyOverride: boolean | undefined;
   const dismissed = new Set<string>();
-  let resumeTimer: ReturnType<typeof setInterval> | undefined;
+  let resumeTimer: ReturnType<typeof setTimeout> | undefined;
+  let resumeActive = false;
 
   const stopResume = (msg?: string) => {
+    resumeActive = false;
     if (resumeTimer) {
-      clearInterval(resumeTimer);
+      clearTimeout(resumeTimer);
       resumeTimer = undefined;
     }
     if (msg) vscode.window.showInformationMessage(msg);
@@ -720,7 +725,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
     vscode.commands.registerCommand("claudeSessionMonitor.stopResumeAll", () =>
       stopResume("Claude Sessions: resume sweep stopped."),
     ),
-    vscode.commands.registerCommand("claudeSessionMonitor.resumeAll", async () => {
+    vscode.commands.registerCommand("claudeSessionMonitor.resumeAll", () => {
       const queue = lastViews.filter((v) => groupOf(v) !== "ended");
       if (!queue.length) {
         vscode.window.showInformationMessage("Claude Sessions: no open sessions to resume.");
@@ -734,73 +739,84 @@ export function activate(ctx: vscode.ExtensionContext): void {
       let i = 0;
       let typed = 0;
       let skipped = 0;
+      resumeActive = true;
 
-      const step = async () => {
+      // Self-chaining: each step is fully awaited before the next is scheduled, so
+      // a slow step (jump + osascript) can never overlap another and type twice.
+      const runOne = async () => {
+        if (!resumeActive) return;
         if (i >= queue.length) {
           stopResume(
             auto
-              ? `Claude Sessions: resume sweep done · typed ${typed}, skipped ${skipped}.`
-              : `Claude Sessions: resume sweep done (${queue.length}).`,
+              ? `Claude Sessions: resume done · typed ${typed}, skipped ${skipped}.`
+              : `Claude Sessions: resume done (${queue.length}).`,
           );
           return;
         }
         const v = queue[i++];
-        await jumpToSession(v);
-        await sleep(500);
-
-        if (!auto) {
-          try {
-            await vscode.commands.executeCommand("claude-vscode.focus");
-          } catch {
-            /* ignore */
-          }
-          const tail = i < queue.length ? ` (next in ${stagger}s)` : " (last)";
-          vscode.window
-            .showInformationMessage(`Resume ${i}/${queue.length}: "${truncate(v.title, 40)}" · press Enter${tail}`, "Stop")
-            .then((x) => {
-              if (x === "Stop") stopResume("Claude Sessions: resume sweep stopped.");
-            });
-          return;
-        }
-
-        // Auto-type: only when the target tab is verified active (never type into the wrong place).
-        const a = activeTabLabel();
-        if (!a || !labelsMatch(a, v.title)) {
-          skipped++;
-          return;
-        }
         try {
-          await vscode.commands.executeCommand("claude-vscode.focus");
-        } catch {
-          /* ignore */
-        }
-        await activateEditorApp();
-        await sleep(150);
-        try {
-          await vscode.commands.executeCommand("claude-vscode.focus");
-        } catch {
-          /* ignore */
-        }
-        await sleep(220);
-        const r = await typeAndSubmit(prompt);
-        if (!r.ok) {
-          if (/not allowed|assistive|accessibility|-1743|-25211|not permitted/i.test(r.err || "")) {
-            stopResume();
+          await jumpToSession(v);
+          await sleep(500);
+          if (!resumeActive) return;
+
+          if (!auto) {
+            try {
+              await vscode.commands.executeCommand("claude-vscode.focus");
+            } catch {
+              /* ignore */
+            }
             vscode.window
-              .showErrorMessage(
-                'Auto-resume needs Accessibility permission. Enable "Visual Studio Code" in System Settings > Privacy & Security > Accessibility, then run Resume All again.',
-                "Open Settings",
-              )
+              .showInformationMessage(`Resume ${i}/${queue.length}: "${truncate(v.title, 40)}" · press Enter`, "Stop")
               .then((x) => {
-                if (x === "Open Settings")
-                  execFile("open", ["x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"], () => {});
+                if (x === "Stop") stopResume("Claude Sessions: resume sweep stopped.");
               });
-            return;
+          } else {
+            await activateEditorApp();
+            await sleep(150);
+            try {
+              await vscode.commands.executeCommand("claude-vscode.focus");
+            } catch {
+              /* ignore */
+            }
+            await sleep(220);
+            if (!resumeActive) return;
+            // Re-verify immediately before typing: correct tab active AND VS Code frontmost.
+            const a = activeTabLabel();
+            const front = await isEditorFrontmost();
+            if (!resumeActive) return;
+            if (!front || !a || !labelsMatch(a, v.title)) {
+              skipped++;
+              log(`resume skip "${truncate(v.title, 40)}": front=${front} active=${a ?? "?"}`);
+            } else {
+              const r = await typeAndSubmit(prompt);
+              if (!r.ok) {
+                if (/not allowed|assistive|accessibility|-1743|-25211|not permitted/i.test(r.err || "")) {
+                  stopResume();
+                  vscode.window
+                    .showErrorMessage(
+                      'Auto-resume needs Accessibility permission. Enable "Visual Studio Code" in System Settings > Privacy & Security > Accessibility, then run Resume All again.',
+                      "Open Settings",
+                    )
+                    .then((x) => {
+                      if (x === "Open Settings")
+                        execFile(
+                          "open",
+                          ["x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility"],
+                          () => {},
+                        );
+                    });
+                  return; // stop the sweep entirely
+                }
+                skipped++;
+              } else {
+                typed++;
+              }
+            }
           }
-          skipped++;
-        } else {
-          typed++;
+        } catch (e) {
+          log("resume step error: " + String(e));
         }
+        if (resumeActive) resumeTimer = setTimeout(runOne, stagger * 1000);
       };
 
       vscode.window.showInformationMessage(
@@ -808,8 +824,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
           ? `Claude Sessions: auto-resuming ${queue.length} sessions, one every ${stagger}s (typing "${prompt}" + Enter). Leave VS Code frontmost.`
           : `Claude Sessions: resuming ${queue.length} sessions, one every ${stagger}s. Press Enter in each.`,
       );
-      await step();
-      resumeTimer = setInterval(step, stagger * 1000);
+      void runOne();
     }),
     vscode.commands.registerCommand("claudeSessionMonitor.openTranscript", (arg?: SessionView | Node) =>
       openTranscript(arg),
@@ -1189,6 +1204,26 @@ function activeTabLabel(): string | undefined {
 function activateEditorApp(): Promise<void> {
   return new Promise((res) => {
     execFile("osascript", ["-e", 'tell application "Visual Studio Code" to activate'], { timeout: 4000 }, () => res());
+  });
+}
+
+/** True if VS Code (Electron) is the frontmost app, so keystrokes will land in it. */
+function isEditorFrontmost(): Promise<boolean> {
+  if (process.platform !== "darwin") return Promise.resolve(true);
+  return new Promise((res) => {
+    execFile(
+      "osascript",
+      ["-e", 'tell application "System Events" to name of first process whose frontmost is true'],
+      { timeout: 4000 },
+      (err, stdout) => {
+        if (err) {
+          res(false);
+          return;
+        }
+        const n = String(stdout).trim().toLowerCase();
+        res(n.includes("code") || n.includes("electron") || n.includes("visual studio"));
+      },
+    );
   });
 }
 
