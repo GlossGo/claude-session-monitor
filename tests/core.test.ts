@@ -1,0 +1,310 @@
+import { describe, it, expect, beforeEach, afterEach } from "vitest";
+import * as fs from "fs";
+import * as os from "os";
+import * as path from "path";
+import {
+  classifyLimit,
+  parseResetToEpoch,
+  formatReset,
+  humanizeAge,
+  parseTranscriptTail,
+  collectSessions,
+  countBuckets,
+  scanTokenUsage,
+  readLimits,
+  readLimitsHistory,
+  type HookStatus,
+  type RecentTranscript,
+} from "../src/core";
+
+// --- helpers ----------------------------------------------------------------
+
+let tmp: string;
+beforeEach(() => {
+  tmp = fs.mkdtempSync(path.join(os.tmpdir(), "csm-test-"));
+});
+afterEach(() => {
+  try {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  } catch {
+    /* ignore */
+  }
+});
+
+const NOW = Math.floor(Date.parse("2026-06-17T12:00:00.000Z") / 1000);
+const iso = (sec: number) => new Date(sec * 1000).toISOString();
+
+function writeTranscript(name: string, lines: unknown[]): string {
+  const p = path.join(tmp, name);
+  fs.writeFileSync(p, lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+  return p;
+}
+
+// --- classifyLimit ----------------------------------------------------------
+
+describe("classifyLimit", () => {
+  it("detects a session limit and parses the reset clock", () => {
+    const r = classifyLimit("You've hit your session limit · resets 1:50pm (Europe/Istanbul)", 429);
+    expect(r?.kind).toBe("session");
+    expect(r?.resetText).toBe("1:50pm");
+  });
+  it("detects a rate limit", () => {
+    const r = classifyLimit("API Error: Server is temporarily limiting requests (not your usage limit) · Rate limited", 429);
+    expect(r?.kind).toBe("rate");
+  });
+  it("returns null for non-limit API errors", () => {
+    expect(classifyLimit("API Error: 529 Overloaded", 529)).toBeNull();
+    expect(classifyLimit("API Error: 500 Internal server error", 500)).toBeNull();
+    expect(classifyLimit("", 429)).toBeNull();
+  });
+});
+
+// --- parseResetToEpoch / formatReset ---------------------------------------
+
+describe("parseResetToEpoch", () => {
+  it("parses 12h and 24h clocks to a future epoch within a day", () => {
+    const t = parseResetToEpoch("1:50pm", NOW);
+    expect(t).toBeDefined();
+    const remain = (t as number) - NOW;
+    expect(remain).toBeGreaterThan(0);
+    expect(remain).toBeLessThanOrEqual(25 * 3600);
+    // 24h form resolves to the same instant as the 12h pm form
+    expect(parseResetToEpoch("13:50", NOW)).toBe(t);
+  });
+  it("rolls a passed time to the next day", () => {
+    const t = parseResetToEpoch("1:50pm", NOW);
+    const future = parseResetToEpoch("1:50pm", (t as number) + 600); // 10 min after it would have passed
+    expect((future as number) - ((t as number) + 600)).toBeGreaterThan(23 * 3600);
+  });
+  it("returns undefined for garbage and out-of-range", () => {
+    expect(parseResetToEpoch("nope", NOW)).toBeUndefined();
+    expect(parseResetToEpoch("25:99", NOW)).toBeUndefined();
+  });
+});
+
+describe("formatReset", () => {
+  it("shows a left countdown and passes garbage through", () => {
+    expect(formatReset("1:50pm", NOW)).toMatch(/left\)$/);
+    expect(formatReset("garbage", NOW)).toBe("garbage");
+  });
+});
+
+// --- humanizeAge ------------------------------------------------------------
+
+describe("humanizeAge", () => {
+  it("formats seconds/minutes/hours/days", () => {
+    expect(humanizeAge(30)).toBe("30s");
+    expect(humanizeAge(90)).toBe("1m");
+    expect(humanizeAge(3700)).toBe("1h");
+    expect(humanizeAge(90000)).toBe("1d");
+    expect(humanizeAge(-5)).toBe("");
+  });
+});
+
+// --- parseTranscriptTail ----------------------------------------------------
+
+describe("parseTranscriptTail", () => {
+  it("extracts title, entrypoint, cwd, and end_turn state (ignoring trailing meta)", () => {
+    const p = writeTranscript("s1.jsonl", [
+      { type: "user", entrypoint: "claude-vscode", cwd: "/repo", message: { content: [{ type: "text", text: "first" }] }, timestamp: iso(NOW - 20) },
+      { type: "assistant", message: { content: [{ type: "tool_use" }], stop_reason: "tool_use" }, timestamp: iso(NOW - 15) },
+      { type: "user", message: { content: [{ type: "tool_result" }] }, timestamp: iso(NOW - 14) },
+      { type: "assistant", message: { content: [{ type: "text", text: "done" }], stop_reason: "end_turn" }, timestamp: iso(NOW - 10) },
+      { type: "ai-title", aiTitle: "My Session Title" },
+      { type: "last-prompt", lastPrompt: "go" },
+      { type: "attachment", attachment: { type: "hook_success" }, timestamp: iso(NOW - 9) },
+    ]);
+    const tx = parseTranscriptTail(p);
+    expect(tx.title).toBe("My Session Title");
+    expect(tx.entrypoint).toBe("claude-vscode");
+    expect(tx.cwd).toBe("/repo");
+    expect(tx.convKind).toBe("end_turn");
+    expect(tx.limit).toBeUndefined();
+    expect(tx.activityTs).toBeGreaterThanOrEqual(tx.convTs);
+  });
+
+  it("classifies a 429 session limit but not a 529 error", () => {
+    const limited = writeTranscript("lim.jsonl", [
+      { type: "user", entrypoint: "claude-vscode", message: { content: [{ type: "text", text: "x" }] }, timestamp: iso(NOW - 30) },
+      { type: "assistant", isApiErrorMessage: true, apiErrorStatus: 429, error: "rate_limit", message: { content: [{ type: "text", text: "You've hit your session limit · resets 1:50pm (Europe/Istanbul)" }] }, timestamp: iso(NOW - 10) },
+    ]);
+    const tx = parseTranscriptTail(limited);
+    expect(tx.convKind).toBe("api_error");
+    expect(tx.limit?.kind).toBe("session");
+    expect(tx.limit?.resetText).toBe("1:50pm");
+
+    const overloaded = writeTranscript("ov.jsonl", [
+      { type: "assistant", isApiErrorMessage: true, apiErrorStatus: 529, message: { content: [{ type: "text", text: "529 Overloaded" }] }, timestamp: iso(NOW - 10) },
+    ]);
+    const tx2 = parseTranscriptTail(overloaded);
+    expect(tx2.convKind).toBe("api_error");
+    expect(tx2.limit).toBeUndefined();
+  });
+
+  it("returns the cached object when the file is unchanged", () => {
+    const p = writeTranscript("c.jsonl", [
+      { type: "assistant", message: { content: [], stop_reason: "end_turn" }, timestamp: iso(NOW - 5) },
+    ]);
+    const a = parseTranscriptTail(p);
+    const b = parseTranscriptTail(p, a);
+    expect(b).toBe(a);
+  });
+
+  it("grows the window to find a conversational line hidden behind a huge last line", () => {
+    const huge = "x".repeat(700 * 1024);
+    const p = writeTranscript("huge.jsonl", [
+      { type: "assistant", message: { content: [{ type: "text", text: "older" }], stop_reason: "end_turn" }, timestamp: iso(NOW - 60) },
+      { type: "user", message: { content: [{ type: "tool_result", content: huge }] }, timestamp: iso(NOW - 5) },
+    ]);
+    const tx = parseTranscriptTail(p);
+    expect(tx.convKind).toBe("tool_result");
+  });
+
+  it("does not throw on a missing file", () => {
+    const tx = parseTranscriptTail(path.join(tmp, "nope.jsonl"));
+    expect(tx.convKind).toBe("none");
+  });
+});
+
+// --- collectSessions (bucket resolution) ------------------------------------
+
+describe("collectSessions", () => {
+  function run(hooks: HookStatus[], extra: RecentTranscript[]) {
+    const map = new Map<string, HookStatus>();
+    for (const h of hooks) map.set(h.session_id, h);
+    return collectSessions({
+      now: NOW,
+      hookStatuses: map,
+      extraTranscripts: extra,
+      maxAgeSec: 24 * 3600,
+      hideEndedOlderThanSec: 24 * 3600,
+    });
+  }
+
+  it("resolves your-turn, waiting, limited, working and filters sdk/observer", () => {
+    const yourTurn = writeTranscript("a.jsonl", [
+      { type: "user", entrypoint: "claude-vscode", cwd: "/repo", message: { content: [{ type: "text", text: "q" }] }, timestamp: iso(NOW - 40) },
+      { type: "assistant", message: { content: [{ type: "text", text: "done" }], stop_reason: "end_turn" }, timestamp: iso(NOW - 30) },
+    ]);
+    const limited = writeTranscript("b.jsonl", [
+      { type: "user", entrypoint: "claude-vscode", cwd: "/repo", message: { content: [{ type: "text", text: "q" }] }, timestamp: iso(NOW - 40) },
+      { type: "assistant", isApiErrorMessage: true, apiErrorStatus: 429, error: "rate_limit", message: { content: [{ type: "text", text: "You've hit your session limit · resets 1:50pm (Europe/Istanbul)" }] }, timestamp: iso(NOW - 20) },
+    ]);
+    const working = writeTranscript("c.jsonl", [
+      { type: "user", entrypoint: "claude-vscode", cwd: "/repo", message: { content: [{ type: "text", text: "q" }] }, timestamp: iso(NOW - 5) },
+      { type: "assistant", message: { content: [{ type: "tool_use" }], stop_reason: "tool_use" }, timestamp: iso(NOW - 2) },
+    ]);
+    const subagent = writeTranscript("d.jsonl", [
+      { type: "user", entrypoint: "sdk-py", cwd: "/repo", message: { content: [{ type: "text", text: "review" }] }, timestamp: iso(NOW - 5) },
+    ]);
+    const observer = writeTranscript("e.jsonl", [
+      { type: "user", entrypoint: "claude-vscode", cwd: "/Users/x/.claude-mem/observer-sessions", message: { content: [{ type: "text", text: "observe" }] }, timestamp: iso(NOW - 5) },
+    ]);
+
+    const hooks: HookStatus[] = [
+      { session_id: "a", state: "idle", ts: NOW - 29, cwd: "/repo", transcript_path: yourTurn },
+      { session_id: "b", state: "working", ts: NOW - 41, cwd: "/repo", transcript_path: limited }, // hook older than the limit line
+      { session_id: "c", state: "working", ts: NOW - 5, cwd: "/repo", transcript_path: working },
+      { session_id: "w", state: "waiting", ts: NOW - 1, cwd: "/repo", transcript_path: yourTurn, message: "needs permission" },
+      { session_id: "d", state: "working", ts: NOW - 5, cwd: "/repo", transcript_path: subagent },
+      { session_id: "e", state: "working", ts: NOW - 5, cwd: "/Users/x/.claude-mem/observer-sessions", transcript_path: observer },
+    ];
+    const views = run(hooks, []);
+    const by = (id: string) => views.find((v) => v.sessionId === id);
+
+    expect(by("a")?.bucket).toBe("attention");
+    expect(by("a")?.sub).toBe("your turn");
+
+    expect(by("b")?.bucket).toBe("limited");
+    expect(by("b")?.sub).toBe("session limit");
+    expect(by("b")?.resetText).toBe("1:50pm");
+
+    expect(by("c")?.bucket).toBe("working");
+
+    expect(by("w")?.bucket).toBe("attention");
+    expect(by("w")?.sub).toBe("waiting for you");
+
+    // sdk-py subagent and observer-sessions are filtered out
+    expect(by("d")).toBeUndefined();
+    expect(by("e")).toBeUndefined();
+  });
+
+  it("includes transcript-only sessions discovered via extraTranscripts", () => {
+    const p = writeTranscript("f.jsonl", [
+      { type: "user", entrypoint: "claude-vscode", cwd: "/repo", message: { content: [{ type: "text", text: "q" }] }, timestamp: iso(NOW - 8) },
+      { type: "assistant", message: { content: [{ type: "text", text: "done" }], stop_reason: "end_turn" }, timestamp: iso(NOW - 6) },
+      { type: "ai-title", aiTitle: "Discovered" },
+    ]);
+    const st = fs.statSync(p);
+    const views = run([], [{ sessionId: "f", path: p, mtimeMs: st.mtimeMs }]);
+    expect(views.find((v) => v.sessionId === "f")?.title).toBe("Discovered");
+  });
+});
+
+describe("countBuckets", () => {
+  it("counts by bucket", () => {
+    const c = countBuckets([
+      { bucket: "working" } as any,
+      { bucket: "working" } as any,
+      { bucket: "limited" } as any,
+    ]);
+    expect(c.working).toBe(2);
+    expect(c.limited).toBe(1);
+    expect(c.attention).toBe(0);
+  });
+});
+
+// --- scanTokenUsage ---------------------------------------------------------
+
+describe("scanTokenUsage", () => {
+  function usageLine(sec: number, input: number, output: number, cacheWrite = 0, cacheRead = 0) {
+    return {
+      type: "assistant",
+      message: { content: [{ type: "text", text: "x" }], usage: { input_tokens: input, output_tokens: output, cache_creation_input_tokens: cacheWrite, cache_read_input_tokens: cacheRead } },
+      timestamp: iso(sec),
+    };
+  }
+
+  it("sums 5h/7d windows excluding cache-read, and buckets hourly", () => {
+    const p = writeTranscript("t.jsonl", [
+      usageLine(NOW - 3600, 1000, 500, 200, 99999), // within 5h -> 1700 (cache_read ignored)
+      usageLine(NOW - 3 * 86400, 2000, 1000, 0, 0), // within 7d, outside 5h -> 3000
+    ]);
+    const offsetsFile = path.join(tmp, "off.json");
+    const bucketsFile = path.join(tmp, "buck.json");
+    const u = scanTokenUsage([{ path: p }], NOW, { offsetsFile, bucketsFile });
+    expect(u.fiveHour).toBe(1700);
+    expect(u.sevenDay).toBe(1700 + 3000);
+    expect(u.hourly.length).toBe(48);
+  });
+
+  it("is incremental: appended lines are counted once, not double", () => {
+    const p = writeTranscript("t2.jsonl", [usageLine(NOW - 1800, 1000, 0)]);
+    const offsetsFile = path.join(tmp, "off2.json");
+    const bucketsFile = path.join(tmp, "buck2.json");
+    const u1 = scanTokenUsage([{ path: p }], NOW, { offsetsFile, bucketsFile });
+    expect(u1.fiveHour).toBe(1000);
+    // append a new line and re-scan with the same state files
+    fs.appendFileSync(p, JSON.stringify(usageLine(NOW - 600, 500, 0)) + "\n");
+    const u2 = scanTokenUsage([{ path: p }], NOW, { offsetsFile, bucketsFile });
+    expect(u2.fiveHour).toBe(1500); // 1000 + 500, old line not recounted
+  });
+});
+
+// --- readLimits / readLimitsHistory -----------------------------------------
+
+describe("readLimits", () => {
+  it("reads a limits snapshot and tolerates a missing file", () => {
+    const f = path.join(tmp, "limits.json");
+    fs.writeFileSync(f, JSON.stringify({ fh: 0.07, sd: 0.25, ts: NOW }));
+    expect(readLimits(f)?.fh).toBe(0.07);
+    expect(readLimits(path.join(tmp, "missing.json"))).toBeUndefined();
+  });
+  it("reads a bounded history tail", () => {
+    const f = path.join(tmp, "hist.jsonl");
+    const lines = Array.from({ length: 10 }, (_, i) => JSON.stringify({ ts: NOW - i * 60, fh: i }));
+    fs.writeFileSync(f, lines.join("\n") + "\n");
+    expect(readLimitsHistory(5, f).length).toBe(5);
+    expect(readLimitsHistory(240, path.join(tmp, "none.jsonl")).length).toBe(0);
+  });
+});

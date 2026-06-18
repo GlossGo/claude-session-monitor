@@ -551,6 +551,7 @@ export interface CollectOpts {
   maxAgeSec?: number;
   allowedEntrypoints?: string[]; // default DEFAULT_ENTRYPOINTS; [] = allow all
   workspaceCwd?: string; // when set, only sessions under this cwd
+  hookStatuses?: Map<string, HookStatus>; // injectable for tests; default readHookStatuses()
 }
 
 function entrypointAllowed(ep: string | undefined, allowed: string[]): boolean {
@@ -561,7 +562,7 @@ function entrypointAllowed(ep: string | undefined, allowed: string[]): boolean {
 
 export function collectSessions(opts: CollectOpts): SessionView[] {
   const now = opts.now;
-  const hooks = readHookStatuses();
+  const hooks = opts.hookStatuses ?? readHookStatuses();
   const txCache = opts.txCache ?? new Map<string, TxInfo>();
   const allowed = opts.allowedEntrypoints ?? DEFAULT_ENTRYPOINTS;
 
@@ -706,19 +707,19 @@ export interface RawLimits {
   ts?: number;
 }
 
-export function readLimits(): RawLimits | undefined {
+export function readLimits(file = LIMITS_FILE): RawLimits | undefined {
   try {
-    return JSON.parse(fs.readFileSync(LIMITS_FILE, "utf8")) as RawLimits;
+    return JSON.parse(fs.readFileSync(file, "utf8")) as RawLimits;
   } catch {
     return undefined;
   }
 }
 
-export function readLimitsHistory(maxPoints = 240): RawLimits[] {
+export function readLimitsHistory(maxPoints = 240, file = LIMITS_HISTORY): RawLimits[] {
   let text = "";
   let partialFirst = false;
   try {
-    const r = readTail(LIMITS_HISTORY, 256 * 1024);
+    const r = readTail(file, 256 * 1024);
     text = r.text;
     partialFirst = r.partialFirst;
   } catch {
@@ -786,13 +787,22 @@ function readJson<T>(file: string, fallback: T): T {
   }
 }
 
+export interface TokenScanOpts {
+  maxBytesPerCall?: number;
+  offsetsFile?: string;
+  bucketsFile?: string;
+}
+
 export function scanTokenUsage(
   transcripts: { path: string }[],
   now: number,
-  maxBytesPerCall = SCAN_BYTE_BUDGET,
+  opts: TokenScanOpts = {},
 ): TokenUsage {
-  const offsets = readJson<Record<string, { offset: number; size: number }>>(TOKEN_OFFSETS, {});
-  const buckets = readJson<Record<string, number>>(TOKEN_BUCKETS, {});
+  const offsetsFile = opts.offsetsFile ?? TOKEN_OFFSETS;
+  const bucketsFile = opts.bucketsFile ?? TOKEN_BUCKETS;
+  const maxBytesPerCall = opts.maxBytesPerCall ?? SCAN_BYTE_BUDGET;
+  const offsets = readJson<Record<string, { offset: number; size: number }>>(offsetsFile, {});
+  const buckets = readJson<Record<string, number>>(bucketsFile, {});
   let bytesRead = 0;
 
   for (const t of transcripts) {
@@ -861,12 +871,12 @@ export function scanTokenUsage(
   for (const k of Object.keys(buckets)) if (parseInt(k, 10) < cutoffHour) delete buckets[k];
 
   try {
-    fs.writeFileSync(TOKEN_OFFSETS, JSON.stringify(offsets));
+    fs.writeFileSync(offsetsFile, JSON.stringify(offsets));
   } catch {
     /* ignore */
   }
   try {
-    fs.writeFileSync(TOKEN_BUCKETS, JSON.stringify(buckets));
+    fs.writeFileSync(bucketsFile, JSON.stringify(buckets));
   } catch {
     /* ignore */
   }
