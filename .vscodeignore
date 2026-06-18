@@ -1,5 +1,9 @@
 .vscode/**
+.github/**
 src/**
+scripts/**
+media/**
+docs/**
 node_modules/**
 dist/verify.cjs
 **/*.ts
@@ -8,3 +12,4 @@ tsconfig.json
 .gitignore
 .git/**
 *.vsix
+CONTRIBUTING.md

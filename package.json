@@ -2,19 +2,42 @@
   "name": "claude-session-monitor",
   "displayName": "Claude Session Monitor",
   "description": "Live monitor for all your Claude Code sessions: which is working, which is waiting for you, which hit a limit, plus per-session CPU/RAM and 5h/7d usage limits.",
-  "version": "0.7.0",
-  "publisher": "softween",
+  "version": "1.0.0",
+  "publisher": "glossgo",
   "license": "MIT",
+  "icon": "icon.png",
+  "homepage": "https://github.com/glossgo/claude-session-monitor#readme",
   "repository": {
     "type": "git",
-    "url": "https://github.com/softween/claude-session-monitor.git"
+    "url": "https://github.com/glossgo/claude-session-monitor.git"
+  },
+  "bugs": {
+    "url": "https://github.com/glossgo/claude-session-monitor/issues"
   },
   "engines": {
     "vscode": "^1.84.0"
   },
   "categories": [
+    "Visualization",
     "Other"
   ],
+  "keywords": [
+    "claude",
+    "claude code",
+    "anthropic",
+    "sessions",
+    "usage",
+    "rate limit",
+    "monitor",
+    "status bar",
+    "ai"
+  ],
+  "galleryBanner": {
+    "color": "#0d1117",
+    "theme": "dark"
+  },
+  "qna": "marketplace",
+  "pricing": "Free",
   "activationEvents": [
     "onStartupFinished"
   ],

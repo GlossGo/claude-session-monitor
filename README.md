@@ -1,123 +1,134 @@
+<div align="center">
+
 # Claude Session Monitor
 
-Live monitor for all your open Claude Code sessions (VS Code tabs) in one panel:
-which is **working**, which is **waiting for you**, which **finished its turn**, and
-which **hit a session/rate limit**, plus **per-session CPU/RAM** and the account
-**5-hour / 7-day usage limits** charted at the bottom.
+**See every Claude Code session at a glance — which is working, which is waiting for you, which hit a limit — plus per-session CPU/RAM and your real 5h / 7d usage budget.**
 
-Built for working with 10-15 Claude tabs at once and seeing each one's state at a glance.
+[![Marketplace](https://img.shields.io/visual-studio-marketplace/v/glossgo.claude-session-monitor?label=Marketplace&color=3794ff)](https://marketplace.visualstudio.com/items?itemName=glossgo.claude-session-monitor)
+[![Installs](https://img.shields.io/visual-studio-marketplace/i/glossgo.claude-session-monitor?color=3fb950)](https://marketplace.visualstudio.com/items?itemName=glossgo.claude-session-monitor)
+[![CI](https://github.com/glossgo/claude-session-monitor/actions/workflows/ci.yml/badge.svg)](https://github.com/glossgo/claude-session-monitor/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-## What it shows
+<img src="https://raw.githubusercontent.com/glossgo/claude-session-monitor/main/media/hero.png" alt="Claude Session Monitor panel" width="380">
 
-Activity Bar container "Claude Sessions" with two views.
+</div>
 
-### Sessions tree (grouped by live state)
+## Why
 
-| Group | Meaning |
-|-------|---------|
-| 🔴 **Limited** | Hit a session limit (with reset countdown) or got rate limited |
-| 🟡 **Waiting for you** | Needs permission/input (Notification) |
-| 🔵 **Your turn** | Finished its turn, your move |
-| 🟢 **Working** | Actively running (after 2 min silent it shows "working (stalled?)") |
-| ⚪ **Ended** | Session closed |
+When you run 10-15 Claude Code tabs at once, you lose track of which one is busy,
+which finished and needs your input, and which quietly hit a rate limit. And you
+can't see how much of your 5-hour / weekly budget is left until you get throttled.
 
-Each row also shows that session's **CPU% + RAM** (e.g. `CPU 14% · 261MB`), a 🔥 on
-CPU hogs, and a live reset countdown for limited sessions. The panel header shows the
-total Claude load; the Activity Bar icon carries a badge with the count of sessions
-that need you.
+Claude Session Monitor puts all of that in one Activity Bar panel, live.
 
-Extras: in-VS-Code toasts + native macOS notifications on urgent transitions, a
-stuck-session alert, a "needs-you only" filter (bell button), and click a row to
-best-effort **jump to that session's tab** (falls back to opening the transcript).
+## Features
 
-### Usage limits (webview)
-
-- **Token usage** (real proxy): rolling **last 5h** and **last 7d** token totals
-  (input + output + cache-write, excluding cheap cache-read) computed from your
-  transcripts, with an hourly bar chart over the last 48h. This is the proactive
-  "how hard am I using Claude" gauge.
-- **Active limit hits** (reactive): the moment any session actually hits a
-  session/rate limit (a 429 in its transcript), it appears here with a live reset
-  countdown.
-- **Official Session (5h) + Weekly (7d) usage**: segmented gauges with **% used**,
-  **% left**, and a reset countdown, fetched from `api.anthropic.com/api/oauth/usage`
-  using your Claude OAuth token from the macOS keychain (`Claude Code-credentials`).
-  Read-only GET of your own account usage (the same source the Claude Usage Bar
-  extension uses), refreshed every ~90s. First access may prompt for keychain
-  permission ("Always Allow"). Falls back to a terminal status line's `limits.json`,
-  then to the token-usage proxy, if unavailable.
-
-## How it works
-
-A pure, `vscode`-free data layer (`src/core.ts`) merges three sources per session:
-
-1. **Hook status files** `~/.claude/session-monitor/<id>.json` written by `hook.py`
-   on SessionStart / UserPromptSubmit / Stop / Notification / SessionEnd. This is the
-   only source of "waiting for you" (permission prompts are not in the transcript) and
-   of the session's worker **PID** (captured by walking the process tree).
-2. **Transcript tail** `~/.claude/projects/.../<id>.jsonl` for the title (`ai-title`),
-   newest conversational state, and limit detection (`isApiErrorMessage` + 429).
-   Only `entrypoint == claude-vscode | cli` sessions are shown (SDK observers/subagents
-   filtered out).
-3. **Usage limits** `~/.claude/session-monitor/limits.json` + `limits-history.jsonl`
-   written by `statusline.sh` from Claude Code's `rate_limits` stdin (5h/7d utilization
-   + reset timestamps).
-
-The extension samples each session PID's CPU/RAM with `ps` (every ~3s).
+- **Live session list, grouped by state** — Limited / Waiting for you / Your turn /
+  Working / Ended. Titles match your tabs; updates in real time.
+- **Per-session CPU% + RAM** — see exactly which session is hammering your machine,
+  with a total at the top and a 🔥 on CPU hogs. *(macOS/Linux)*
+- **Official usage budget** — real **Session (5h)** and **Weekly (7d)** gauges with
+  **% used**, **% left**, and a reset countdown, pulled from your own account. Plus a
+  **token-usage trend** (rolling 5h / 7d) with an hourly chart. *(official gauges: macOS)*
+- **Notifications** — in-VS-Code toasts and native macOS notifications the moment a
+  session needs you or hits a limit (even when VS Code isn't focused).
+- **Stuck-session alert** — flags a "working" session that has gone silent too long.
+- **Staggered Resume All** — after an internet drop, resume every session
+  automatically, spaced one per minute so you don't trip the rate limit by resuming
+  all at once. Fully automated via keystrokes (no manual typing). *(macOS)*
+- **Quality of life** — Activity Bar badge for sessions needing you, a "needs-you
+  only" filter, jump to a session's tab on click, and one-click clear/remove of
+  ended sessions.
 
 ## Install
 
-Hook + status line (once, additive to `~/.claude/settings.json`):
+### From the Marketplace
 
-```jsonc
-"hooks": {
-  "SessionStart":     [{ "matcher": "startup|resume|clear|compact", "hooks": [{ "type": "command", "command": "/opt/homebrew/bin/python3 ~/.claude/session-monitor/hook.py SessionStart" }] }],
-  "UserPromptSubmit": [{ "hooks": [{ "type": "command", "command": "/opt/homebrew/bin/python3 ~/.claude/session-monitor/hook.py UserPromptSubmit" }] }],
-  "Stop":             [{ "hooks": [{ "type": "command", "command": "/opt/homebrew/bin/python3 ~/.claude/session-monitor/hook.py Stop" }] }],
-  "Notification":     [{ "hooks": [{ "type": "command", "command": "/opt/homebrew/bin/python3 ~/.claude/session-monitor/hook.py Notification" }] }],
-  "SessionEnd":       [{ "hooks": [{ "type": "command", "command": "/opt/homebrew/bin/python3 ~/.claude/session-monitor/hook.py SessionEnd" }] }]
-},
-"statusLine": { "type": "command", "command": "bash ~/.claude/session-monitor/statusline.sh", "padding": 0 }
-```
-
-> The status line is required to read the 5h/7d limit budget; it also prints a compact
-> `Claude  5h NN%  ·  7d NN%` line in each Claude session. Both the hooks and the status
-> line are picked up after a window reload.
-
-Extension:
+Search **"Claude Session Monitor"** in the Extensions view, or:
 
 ```bash
-npm install
-npm run build
-npm run package        # -> claude-session-monitor-0.3.0.vsix
-code --install-extension claude-session-monitor-0.3.0.vsix
+code --install-extension glossgo.claude-session-monitor
 ```
 
-Reload the window (Developer: Reload Window).
+### Hook layer (one command)
 
-## Settings (`claudeSessionMonitor.*`)
+The status list and per-session CPU/RAM use a tiny hook layer. Run once:
+
+```bash
+git clone https://github.com/glossgo/claude-session-monitor.git
+bash claude-session-monitor/scripts/install.sh
+```
+
+This copies `hook.py` into `~/.claude/session-monitor/` and merges five status hooks
+(SessionStart / UserPromptSubmit / Stop / Notification / SessionEnd) into
+`~/.claude/settings.json` (idempotent, with a backup). Reload the VS Code window.
+
+> The official 5h/7d usage gauges need **no hook** — the extension reads them
+> directly. Auto-resume needs a one-time macOS **Accessibility** permission for VS
+> Code (System Settings > Privacy & Security > Accessibility).
+
+## How it works
+
+A pure, `vscode`-free data layer merges three sources per session:
+
+1. **Hook status files** (`~/.claude/session-monitor/<id>.json`) for live state
+   ("waiting for you" is only knowable here) and the session's worker PID (for CPU/RAM).
+2. **Transcript tail** (`~/.claude/projects/.../<id>.jsonl`) for the title, newest
+   conversational state, limit detection, and the token-usage trend. Only interactive
+   sessions (`entrypoint = claude-vscode | cli`) are shown.
+3. **Official account usage** from `api.anthropic.com/api/oauth/usage`, using your
+   Claude OAuth token from the macOS keychain (`Claude Code-credentials`).
+
+### Privacy
+
+- No telemetry. Nothing is sent anywhere except a **read-only GET of your own account
+  usage** to Anthropic (the same call the Claude app makes), and only on macOS.
+- The keychain token is read locally to authorize that call and is never stored or
+  logged by this extension.
+- CPU/RAM come from a local `ps`; auto-resume uses local `osascript` keystrokes.
+
+## Configuration
+
+All settings are under `claudeSessionMonitor.*`:
 
 | Setting | Default | Description |
-|---------|---------|-------------|
-| `notifyOnWaiting` | `true` | Notify on transition to waiting-for-you |
-| `notifyOnLimited` | `true` | Notify on transition to limited |
+|---|---|---|
+| `notifyOnWaiting` | `true` | Notify when a session starts waiting for you |
+| `notifyOnLimited` | `true` | Notify when a session hits a limit |
 | `notifyOnDone` | `false` | Notify when a session finishes its turn |
 | `nativeNotifications` | `true` | Native macOS notification on limit/waiting |
 | `stuckAlertMinutes` | `5` | Alert when a working session is silent this long (0 = off) |
 | `cpuHogThreshold` | `60` | CPU% above which a session is flagged 🔥 |
+| `resumeAutoType` | `true` | Auto-type resume + Enter (needs Accessibility) |
+| `resumePrompt` | `"resume"` | Text typed during a resume sweep |
+| `resumeStaggerSeconds` | `60` | Seconds between sessions in a resume sweep |
 | `resourceSampleMs` | `3000` | CPU/RAM sampling interval |
 | `pollIntervalMs` | `1500` | Status refresh interval |
 | `recentScanMaxAgeHours` | `6` | Show sessions active within the last N hours |
 | `hideEndedAfterMinutes` | `30` | Hide ended sessions after this long |
 | `workspaceOnly` | `false` | Only show this workspace's sessions |
 
+## Platform support
+
+| Feature | macOS | Linux | Windows |
+|---|:---:|:---:|:---:|
+| Session list + state + token usage | ✅ | ✅ | ✅ |
+| Per-session CPU / RAM | ✅ | ✅ | ⚠️ |
+| Official 5h / 7d usage gauges | ✅ | ➖ | ➖ |
+| Native notifications + auto-resume | ✅ | ➖ | ➖ |
+
+Cross-platform support for the macOS-only pieces is welcome via PRs.
+
 ## Development
 
 ```bash
-npm run watch     # esbuild --watch
-npm run verify    # run the core data layer against real transcripts
+npm install
+npm run build      # esbuild bundle
+npm run watch      # rebuild on change
+npm run verify     # run the core data layer against your real transcripts
+npm run package    # build a .vsix
 ```
 
 ## License
 
-MIT
+[MIT](LICENSE) © glossgo
