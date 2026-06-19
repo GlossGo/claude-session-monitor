@@ -555,6 +555,7 @@ export interface CollectOpts {
   allowedEntrypoints?: string[]; // default DEFAULT_ENTRYPOINTS; [] = allow all
   workspaceCwd?: string; // when set, only sessions under this cwd
   hookStatuses?: Map<string, HookStatus>; // injectable for tests; default readHookStatuses()
+  showEnded?: boolean; // default false: closed/ended sessions are hidden entirely
 }
 
 function entrypointAllowed(ep: string | undefined, allowed: string[]): boolean {
@@ -597,10 +598,12 @@ export function collectSessions(opts: CollectOpts): SessionView[] {
 
   const maxAge = opts.maxAgeSec ?? 6 * 3600;
   const hideEnded = opts.hideEndedOlderThanSec ?? 30 * 60;
+  const showEnded = opts.showEnded ?? false;
   const wsCwd = opts.workspaceCwd;
 
   const filtered = views.filter((v) => {
     if (wsCwd && v.cwd !== wsCwd) return false;
+    if (v.bucket === "ended" && !showEnded) return false; // closed sessions hidden by default
     const ageSec = v.lastActivityMs ? now - v.lastActivityMs / 1000 : Infinity;
     if (v.bucket === "ended" && ageSec > hideEnded) return false;
     if (ageSec > maxAge) return false;

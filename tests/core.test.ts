@@ -439,16 +439,19 @@ describe("resolve / collectSessions branch coverage", () => {
     expect(v?.sub).toBe("working (stalled?)");
   });
 
-  it("shows an ended session, and hides it once older than the cutoff", () => {
+  it("hides ended sessions by default, shows them only with showEnded, and respects the cutoff", () => {
     const fresh = writeTranscript("enf.jsonl", [
       { type: "assistant", entrypoint: "claude-vscode", message: { content: [{ type: "text", text: "bye" }], stop_reason: "end_turn" }, timestamp: iso(NOW - 5) },
     ]);
-    expect(collect([{ session_id: "enf", state: "ended", ts: NOW - 5, cwd: "/repo", transcript_path: fresh }]).find((x) => x.sessionId === "enf")?.bucket).toBe("ended");
+    const hook = [{ session_id: "enf", state: "ended", ts: NOW - 5, cwd: "/repo", transcript_path: fresh }];
+    expect(collect(hook).find((x) => x.sessionId === "enf")).toBeUndefined(); // default: hidden
+    expect(collect(hook, { showEnded: true }).find((x) => x.sessionId === "enf")?.bucket).toBe("ended"); // shown
     const old = backdated("eno.jsonl", [
       { type: "assistant", entrypoint: "claude-vscode", message: { content: [{ type: "text", text: "bye" }], stop_reason: "end_turn" }, timestamp: iso(NOW - 3600) },
     ], NOW - 3600);
-    const hidden = collect([{ session_id: "eno", state: "ended", ts: NOW - 3600, cwd: "/repo", transcript_path: old }], { hideEndedOlderThanSec: 60 });
-    expect(hidden.find((x) => x.sessionId === "eno")).toBeUndefined();
+    expect(
+      collect([{ session_id: "eno", state: "ended", ts: NOW - 3600, cwd: "/repo", transcript_path: old }], { showEnded: true, hideEndedOlderThanSec: 60 }).find((x) => x.sessionId === "eno"),
+    ).toBeUndefined(); // showEnded but past cutoff
   });
 
   it("derives working from assistant-without-stop-reason and from a trailing user prompt", () => {

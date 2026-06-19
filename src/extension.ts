@@ -597,6 +597,7 @@ export function activate(ctx: vscode.ExtensionContext): void {
         maxAgeSec: maxAgeHours * 3600,
         hideEndedOlderThanSec: c.get<number>("hideEndedAfterMinutes", 30) * 60,
         workspaceCwd: wsOnly ? workspaceCwd() : undefined,
+        showEnded: c.get<boolean>("showEnded", false),
       });
     } catch {
       views = [];
